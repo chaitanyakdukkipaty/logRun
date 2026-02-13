@@ -239,7 +239,7 @@ main() {
     # Verify installation
     if command -v "$BINARY_NAME" >/dev/null 2>&1; then
         log_info "Verification successful!"
-        "$BINARY_NAME" --version
+        log_info "LogRun is now available in your PATH"
     else
         log_warn "LogRun was installed but may not be in your PATH."
         log_warn "Try running: export PATH=\"$INSTALL_DIR:\$PATH\""
