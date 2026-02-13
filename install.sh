@@ -111,7 +111,7 @@ install_binary() {
     local http_status
     http_status=$(curl -s -I "$download_url" | head -n 1 | cut -d' ' -f2)
     
-    if [ "$http_status" != "200" ]; then
+    if [ "$http_status" != "200" ] && [ "$http_status" != "302" ]; then
         log_error "Release file not found at: $download_url"
         log_error "HTTP Status: $http_status"
         log_error "Please check if the release has been properly built and uploaded."
