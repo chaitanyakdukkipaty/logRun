@@ -2,6 +2,7 @@
 
 # LogRun Installation Script
 # Usage: curl -sSL https://raw.githubusercontent.com/chaitanyakdukkipaty/logRun/main/install.sh | bash
+# Debug: DEBUG=true curl -sSL https://raw.githubusercontent.com/chaitanyakdukkipaty/logRun/main/install.sh | bash
 
 set -e
 
@@ -9,6 +10,7 @@ set -e
 REPO="chaitanyakdukkipaty/logRun" 
 INSTALL_DIR="/usr/local/bin"
 BINARY_NAME="logrun"
+DEBUG=${DEBUG:-false}
 
 # Colors for output
 RED='\033[0;31m'
@@ -27,6 +29,12 @@ log_warn() {
 
 log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
+}
+
+log_debug() {
+    if [ "$DEBUG" = "true" ]; then
+        echo -e "${YELLOW}[DEBUG]${NC} $1"
+    fi
 }
 
 # Detect OS and architecture
@@ -72,9 +80,14 @@ get_latest_version() {
     version=$(curl -s "https://api.github.com/repos/${REPO}/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
     
     if [ -z "$version" ]; then
-        log_error "Failed to get latest version"
+        log_error "Failed to get latest version from GitHub API"
+        log_error "This could be due to rate limiting or network issues"
+        log_error "You can also check manually at: https://github.com/${REPO}/releases/latest"
         exit 1
     fi
+    
+    # Debug: show what we got from the API call
+    log_info "GitHub API returned version: $version"
     
     echo "$version"
 }
@@ -91,15 +104,90 @@ install_binary() {
     
     local download_url="https://github.com/${REPO}/releases/download/${version}/logrun-${version}-${platform}.tar.gz"
     
-    if ! curl -sL "$download_url" | tar -xz -C "$tmp_dir"; then
-        log_error "Failed to download or extract LogRun"
+    log_info "Download URL: $download_url"
+    log_debug "Using temp directory: $tmp_dir"
+    
+    # Check if the file exists first
+    local http_status
+    http_status=$(curl -s -I "$download_url" | head -n 1 | cut -d' ' -f2)
+    
+    if [ "$http_status" != "200" ]; then
+        log_error "Release file not found at: $download_url"
+        log_error "HTTP Status: $http_status"
+        log_error "Please check if the release has been properly built and uploaded."
+        log_error "Visit: https://github.com/${REPO}/releases"
         exit 1
     fi
     
-    local binary_path="$tmp_dir/logrun-${version}-${platform}"
+    # Download file to temp location first for inspection
+    local archive_file="$tmp_dir/logrun.tar.gz"
+    log_info "Downloading to: $archive_file"
     
-    if [ ! -f "$binary_path" ]; then
+    if ! curl -sL "$download_url" -o "$archive_file"; then
+        log_error "Failed to download LogRun"
+        exit 1
+    fi
+    
+    # Check if it's actually a tar.gz file
+    local file_type
+    if command -v file >/dev/null 2>&1; then
+        file_type=$(file "$archive_file" 2>/dev/null || echo "unknown")
+        log_info "Downloaded file type: $file_type"
+        
+        if [[ "$file_type" != *"gzip compressed"* ]]; then
+            log_error "Downloaded file is not a valid gzip archive"
+            log_error "File content (first 200 chars):"
+            head -c 200 "$archive_file" | cat -v
+            exit 1
+        fi
+    else
+        log_warn "file command not available, skipping file type check"
+        # Try to verify it's gzip by checking magic bytes
+        local magic_bytes
+        magic_bytes=$(head -c 2 "$archive_file" | od -x | head -n1 | awk '{print $2}')
+        if [ "$magic_bytes" != "8b1f" ]; then
+            log_error "Downloaded file does not appear to be a gzip archive"
+            log_error "File content (first 200 chars):"
+            head -c 200 "$archive_file" | cat -v
+            exit 1
+        fi
+    fi
+    
+    # Extract the archive
+    if ! tar -xzf "$archive_file" -C "$tmp_dir"; then
+        log_error "Failed to extract LogRun archive"
+        log_error "Archive contents:"
+        tar -tzf "$archive_file" 2>/dev/null || echo "Cannot list archive contents"
+        exit 1
+    fi
+    
+    # Find the binary in the extracted archive
+    local binary_path
+    
+    # Try different possible binary names
+    local possible_names=(
+        "logrun-${version}-${platform}"
+        "logrun"
+        "${BINARY_NAME}"
+    )
+    
+    log_info "Looking for binary in extracted files..."
+    log_info "Archive contents:"
+    ls -la "$tmp_dir"
+    
+    for name in "${possible_names[@]}"; do
+        if [ -f "$tmp_dir/$name" ]; then
+            binary_path="$tmp_dir/$name"
+            log_info "Found binary: $name"
+            break
+        fi
+    done
+    
+    if [ -z "$binary_path" ]; then
         log_error "Binary not found in downloaded archive"
+        log_error "Tried the following names: ${possible_names[*]}"
+        log_error "Available files:"
+        find "$tmp_dir" -type f -executable 2>/dev/null || find "$tmp_dir" -type f
         exit 1
     fi
     
@@ -129,6 +217,12 @@ main() {
     # Check if curl is available
     if ! command -v curl >/dev/null 2>&1; then
         log_error "curl is required but not installed. Please install curl and try again."
+        exit 1
+    fi
+    
+    # Check if tar is available
+    if ! command -v tar >/dev/null 2>&1; then
+        log_error "tar is required but not installed. Please install tar and try again."
         exit 1
     fi
     
