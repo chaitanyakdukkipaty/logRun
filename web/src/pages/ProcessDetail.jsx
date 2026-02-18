@@ -318,10 +318,14 @@ export default function ProcessDetail() {
             <h3 className="text-sm font-medium text-gray-500 mb-2">Status</h3>
             <div className={`status-badge status-${process.status} inline-flex items-center`}>
               <span className="capitalize">{process.status}</span>
-              {process.exit_code !== null && (
-                <span className="ml-1">(exit: {process.exit_code})</span>
-              )}
             </div>
+            {process.commands && process.commands.length > 1 && (
+              <div className="text-xs text-gray-500 mt-1">
+                {process.commands.filter(cmd => cmd.status === 'running').length} running, {' '}
+                {process.commands.filter(cmd => cmd.status === 'completed').length} completed, {' '}
+                {process.commands.filter(cmd => cmd.status === 'failed').length} failed
+              </div>
+            )}
           </div>
           
           <div>
@@ -341,10 +345,52 @@ export default function ProcessDetail() {
         </div>
 
         <div className="mt-6">
-          <h3 className="text-sm font-medium text-gray-500 mb-2">Command</h3>
-          <div className="bg-gray-100 rounded-lg p-3 font-mono text-sm">
-            {process.command}
-          </div>
+          <h3 className="text-sm font-medium text-gray-500 mb-2">
+            Commands ({process.commands?.length || 0})
+          </h3>
+          {process.commands && process.commands.length > 0 ? (
+            <div className="space-y-3">
+              {process.commands.map((cmd, index) => (
+                <div key={cmd.command_id || index} className="bg-gray-100 rounded-lg p-3">
+                  <div className="flex items-center justify-between mb-2">
+                    <div className="flex items-center space-x-2">
+                      <div className={`h-2 w-2 rounded-full ${
+                        cmd.status === 'running' ? 'bg-blue-400' :
+                        cmd.status === 'completed' ? 'bg-green-400' :
+                        'bg-red-400'
+                      }`}></div>
+                      <span className="text-xs text-gray-500 uppercase tracking-wide">
+                        {cmd.status}
+                      </span>
+                      {cmd.pid && (
+                        <span className="text-xs text-gray-500">PID: {cmd.pid}</span>
+                      )}
+                    </div>
+                    {cmd.status !== 'running' && cmd.exit_code !== null && (
+                      <span className={`text-xs px-2 py-1 rounded ${
+                        cmd.exit_code === 0 ? 'bg-green-200 text-green-800' : 'bg-red-200 text-red-800'
+                      }`}>
+                        Exit: {cmd.exit_code}
+                      </span>
+                    )}
+                  </div>
+                  <div className="font-mono text-sm text-gray-800">
+                    {cmd.command}
+                  </div>
+                  {(cmd.start_time || cmd.end_time) && (
+                    <div className="text-xs text-gray-500 mt-2">
+                      {cmd.start_time && `Started: ${formatDistanceToNow(new Date(cmd.start_time), { addSuffix: true })}`}
+                      {cmd.end_time && ` • Ended: ${formatDistanceToNow(new Date(cmd.end_time), { addSuffix: true })}`}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="bg-gray-50 rounded-lg p-4 text-center text-gray-500">
+              No commands found
+            </div>
+          )}
         </div>
 
         {process.tags && process.tags.length > 0 && (

@@ -20,23 +20,33 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// ProcessMetadata represents process information
-type ProcessMetadata struct {
-	ProcessID string    `json:"process_id"`
-	Name      string    `json:"name"`
-	Command   string    `json:"command"`
-	PID       int       `json:"pid"`
-	Status    string    `json:"status"`
-	ExitCode  *int      `json:"exit_code,omitempty"`
-	StartTime time.Time `json:"start_time"`
+// CommandInfo represents a single command within a process
+type CommandInfo struct {
+	CommandID string     `json:"command_id"`
+	Command   string     `json:"command"`
+	PID       int        `json:"pid"`
+	Status    string     `json:"status"`
+	ExitCode  *int       `json:"exit_code,omitempty"`
+	StartTime time.Time  `json:"start_time"`
 	EndTime   *time.Time `json:"end_time,omitempty"`
-	Tags      []string  `json:"tags"`
-	CWD       string    `json:"cwd"`
+}
+
+// ProcessMetadata represents process information with multiple commands
+type ProcessMetadata struct {
+	ProcessID string        `json:"process_id"`
+	Name      string        `json:"name"`
+	Commands  []CommandInfo `json:"commands"`
+	Status    string        `json:"status"`
+	StartTime time.Time     `json:"start_time"`
+	EndTime   *time.Time    `json:"end_time,omitempty"`
+	Tags      []string      `json:"tags"`
+	CWD       string        `json:"cwd"`
 }
 
 // LogEntry represents a single log line
 type LogEntry struct {
 	ProcessID string    `json:"process_id"`
+	CommandID string    `json:"command_id"`
 	Timestamp time.Time `json:"timestamp"`
 	Stream    string    `json:"stream"`
 	Message   string    `json:"message"`
@@ -194,15 +204,51 @@ func runCommand(cmd *cobra.Command, args []string) error {
 		processName = args[0]
 	}
 
-	// Create process metadata
-	metadata := &ProcessMetadata{
-		ProcessID: processID,
-		Name:      processName,
-		Command:   cmdStr,
-		Status:    "running",
-		StartTime: time.Now(),
-		Tags:      tagList,
-		CWD:       workDir,
+	// Check if process with same name exists
+	existingProcess, err := runner.getProcessByName(processName)
+
+	var commandID string
+	var metadata *ProcessMetadata
+
+	if err == nil && existingProcess != nil && existingProcess.Status == "running" {
+		// Process exists and is running, add to existing
+		processID = existingProcess.ProcessID
+		commandID = uuid.New().String()
+		metadata = existingProcess
+
+		// Add new command to existing process
+		newCommand := CommandInfo{
+			CommandID: commandID,
+			Command:   cmdStr,
+			PID:       0, // Will be set after command starts
+			Status:    "running",
+			StartTime: time.Now(),
+		}
+		metadata.Commands = append(metadata.Commands, newCommand)
+
+		fmt.Printf("Adding command to existing process %s (name: %s)\n", processID, processName)
+	} else {
+		// Create new process
+		processID = uuid.New().String()
+		commandID = uuid.New().String()
+		metadata = &ProcessMetadata{
+			ProcessID: processID,
+			Name:      processName,
+			Commands: []CommandInfo{
+				{
+					CommandID: commandID,
+					Command:   cmdStr,
+					Status:    "running",
+					StartTime: time.Now(),
+				},
+			},
+			Status:    "running",
+			StartTime: time.Now(),
+			Tags:      tagList,
+			CWD:       workDir,
+		}
+
+		fmt.Printf("Creating new process %s (name: %s)\n", processID, processName)
 	}
 
 	// Send initial metadata to API
@@ -237,15 +283,9 @@ func runCommand(cmd *cobra.Command, args []string) error {
 		cancelled = true
 		cancelMutex.Unlock()
 		
-		// Update process status to cancelled
-		endTime := time.Now()
-		metadata.EndTime = &endTime
-		metadata.Status = "cancelled"
-		exitCode := -1 // Indicate termination by signal
-		metadata.ExitCode = &exitCode
-		
-		if err := runner.updateProcess(metadata); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: Failed to update process cancellation: %v\n", err)
+		// Use atomic command update for cancellation
+		if err := runner.updateCommandStatus(processID, commandID, "cancelled", -1, time.Now()); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: Failed to update command cancellation: %v\n", err)
 		}
 		
 		// Terminate the child process
@@ -253,7 +293,7 @@ func runCommand(cmd *cobra.Command, args []string) error {
 			execCmd.Process.Kill()
 		}
 		
-		fmt.Println("\nProcess cancelled by user")
+		fmt.Printf("\nCommand %s cancelled by user\n", commandID)
 		os.Exit(130) // Standard exit code for Ctrl+C
 	}()
 
@@ -276,21 +316,46 @@ func runCommand(cmd *cobra.Command, args []string) error {
 
 	// Start the command
 	if err := execCmd.Start(); err != nil {
-		metadata.Status = "failed"
-		metadata.ExitCode = new(int)
-		*metadata.ExitCode = 1
-		endTime := time.Now()
-		metadata.EndTime = &endTime
+		// Update the specific command status
+		for i := range metadata.Commands {
+			if metadata.Commands[i].CommandID == commandID {
+				metadata.Commands[i].Status = "failed"
+				metadata.Commands[i].ExitCode = new(int)
+				*metadata.Commands[i].ExitCode = 1
+				endTime := time.Now()
+				metadata.Commands[i].EndTime = &endTime
+				break
+			}
+		}
+		// Update overall process status if all commands failed
+		allFailed := true
+		for _, cmd := range metadata.Commands {
+			if cmd.Status == "running" {
+				allFailed = false
+				break
+			}
+		}
+		if allFailed {
+			metadata.Status = "failed"
+			endTime := time.Now()
+			metadata.EndTime = &endTime
+		}
 		runner.updateProcess(metadata)
 		return fmt.Errorf("failed to start command: %w", err)
 	}
 
-	metadata.PID = execCmd.Process.Pid
+	// Update the specific command with PID
+	for i := range metadata.Commands {
+		if metadata.Commands[i].CommandID == commandID {
+			metadata.Commands[i].PID = execCmd.Process.Pid
+			break
+		}
+	}
 	if err := runner.updateProcess(metadata); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: Failed to update process with API: %v\n", err)
 	}
 
-	fmt.Printf("Started process %s (PID: %d)\n", processID, execCmd.Process.Pid)
+	fmt.Printf("Started command %s in process %s (PID: %d)\n", commandID, processID, execCmd.Process.Pid)
 
 	// Initialize log batcher for efficient batch processing
 	runner.batcher = NewLogBatcher(processID, runner.apiBaseURL, runner.httpClient, runner.batchConfig)
@@ -304,20 +369,20 @@ func runCommand(cmd *cobra.Command, args []string) error {
 	// Stream stdout
 	go func() {
 		defer wg.Done()
-		runner.streamLogs(stdout, "stdout", processID, logFile)
+		runner.streamLogs(stdout, "stdout", processID, commandID, logFile)
 	}()
 
 	// Stream stderr
 	go func() {
 		defer wg.Done()
-		runner.streamLogs(stderr, "stderr", processID, logFile)
+		runner.streamLogs(stderr, "stderr", processID, commandID, logFile)
 	}()
 
-	// Wait for streaming to complete
-	wg.Wait()
-
-	// Wait for command to complete
+	// Wait for command to complete first
 	err = execCmd.Wait()
+	
+	// Then wait for streaming to complete (pipes will be closed after command ends)
+	wg.Wait()
 	
 	// Check if process was cancelled via signal
 	cancelMutex.Lock()
@@ -330,31 +395,29 @@ func runCommand(cmd *cobra.Command, args []string) error {
 	}
 	
 	endTime := time.Now()
-	metadata.EndTime = &endTime
 
-	// Get exit code
+	// Update the specific command status atomically 
 	exitCode := 0
+	status := "completed"
 	if err != nil {
 		if exitError, ok := err.(*exec.ExitError); ok {
-			if status, ok := exitError.Sys().(syscall.WaitStatus); ok {
-				exitCode = status.ExitStatus()
+			if exitStatus, ok := exitError.Sys().(syscall.WaitStatus); ok {
+				exitCode = exitStatus.ExitStatus()
 			}
 		}
-		metadata.Status = "failed"
-	} else {
-		metadata.Status = "completed"
+		status = "failed"
 	}
 
-	metadata.ExitCode = &exitCode
-	if err := runner.updateProcess(metadata); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: Failed to update process completion: %v\n", err)
+	// Use atomic command update instead of full process update
+	if updateErr := runner.updateCommandStatus(processID, commandID, status, exitCode, endTime); updateErr != nil {
+		fmt.Fprintf(os.Stderr, "Warning: Failed to update command status: %v\n", updateErr)
 	}
 
-	fmt.Printf("Process %s completed with exit code %d\n", processID, exitCode)
+	fmt.Printf("Command %s in process %s completed with exit code %d\n", commandID, processID, exitCode)
 	return nil
 }
 
-func (lr *LogRunner) streamLogs(reader io.Reader, stream, processID string, logFile *os.File) {
+func (lr *LogRunner) streamLogs(reader io.Reader, stream, processID, commandID string, logFile *os.File) {
 	scanner := bufio.NewScanner(reader)
 	var currentEntry *LogEntry
 	var entryBuilder strings.Builder
@@ -433,6 +496,7 @@ func (lr *LogRunner) streamLogs(reader io.Reader, stream, processID string, logF
 			// Start a new entry
 			currentEntry = &LogEntry{
 				ProcessID: processID,
+				CommandID: commandID,
 				Timestamp: time.Now(),
 				Stream:    stream,
 				Message:   "", // Will be set when flushing
@@ -446,6 +510,7 @@ func (lr *LogRunner) streamLogs(reader io.Reader, stream, processID string, logF
 			// No current entry, treat this as a new entry anyway
 			currentEntry = &LogEntry{
 				ProcessID: processID,
+				CommandID: commandID,
 				Timestamp: time.Now(),
 				Stream:    stream,
 				Message:   "",
@@ -562,6 +627,32 @@ func (lr *LogRunner) isNewLogEntry(line string) bool {
 }
 
 // HTTP API methods
+func (lr *LogRunner) getProcessByName(name string) (*ProcessMetadata, error) {
+	resp, err := lr.httpClient.Get(
+		fmt.Sprintf("%s/processes/by-name/%s", lr.apiBaseURL, name),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send HTTP request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 404 {
+		return nil, nil // Process not found
+	}
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
+	}
+
+	var process ProcessMetadata
+	if err := json.NewDecoder(resp.Body).Decode(&process); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	return &process, nil
+}
+
 func (lr *LogRunner) createProcess(metadata *ProcessMetadata) error {
 	jsonData, err := json.Marshal(metadata)
 	if err != nil {
@@ -595,6 +686,43 @@ func (lr *LogRunner) updateProcess(metadata *ProcessMetadata) error {
 	req, err := http.NewRequest(
 		"PUT",
 		fmt.Sprintf("%s/processes/%s", lr.apiBaseURL, metadata.ProcessID),
+		bytes.NewBuffer(jsonData),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create HTTP request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := lr.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send HTTP request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
+	}
+
+	return nil
+}
+
+// Atomic command status update to prevent race conditions
+func (lr *LogRunner) updateCommandStatus(processID, commandID, status string, exitCode int, endTime time.Time) error {
+	updateData := map[string]interface{}{
+		"status":    status,
+		"exit_code": exitCode,
+		"end_time":  endTime.Format(time.RFC3339),
+	}
+
+	jsonData, err := json.Marshal(updateData)
+	if err != nil {
+		return fmt.Errorf("failed to marshal command update: %w", err)
+	}
+
+	req, err := http.NewRequest(
+		"PUT",
+		fmt.Sprintf("%s/processes/%s/commands/%s", lr.apiBaseURL, processID, commandID),
 		bytes.NewBuffer(jsonData),
 	)
 	if err != nil {

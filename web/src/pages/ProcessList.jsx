@@ -1,4 +1,5 @@
 import { useQuery } from '@tanstack/react-query'
+import { useEffect } from 'react'
 import { Link } from 'react-router-dom'
 import { formatDistanceToNow } from 'date-fns'
 import { Play, Square, AlertCircle, Clock, ExternalLink, Trash2, Terminal } from 'lucide-react'
@@ -10,6 +11,23 @@ export default function ProcessList() {
     queryFn: getProcesses,
     refetchInterval: 5000, // Refresh every 5 seconds
   })
+
+  // Cleanup stale processes periodically
+  useEffect(() => {
+    const cleanupStaleProcesses = async () => {
+      try {
+        await fetch('/api/health')
+      } catch (error) {
+        console.error('Failed to cleanup stale processes:', error)
+      }
+    }
+
+    // Cleanup immediately and then every 30 seconds
+    cleanupStaleProcesses()
+    const interval = setInterval(cleanupStaleProcesses, 30000)
+    
+    return () => clearInterval(interval)
+  }, [])
 
   const handleDelete = async (processId) => {
     if (window.confirm('Are you sure you want to delete this process and its logs?')) {
@@ -129,17 +147,43 @@ export default function ProcessList() {
                             {process.name || 'Unnamed Process'}
                           </div>
                           <div className="text-sm text-gray-500">
-                            PID: {process.pid || 'N/A'}
+                            {process.commands && process.commands.length > 0 ? (
+                              process.commands.length === 1 ? (
+                                `PID: ${process.commands[0].pid || 'N/A'}`
+                              ) : (
+                                `${process.commands.length} commands`
+                              )
+                            ) : 'No commands'}
                           </div>
                         </div>
                       </div>
                     </td>
                     <td className="px-6 py-4">
-                      <div className="text-sm text-gray-900 font-mono max-w-xs truncate">
-                        {process.command}
-                      </div>
+                      {process.commands && process.commands.length > 0 ? (
+                        <div className="space-y-1">
+                          {process.commands.slice(0, 2).map((cmd, index) => (
+                            <div key={cmd.command_id || index} className="text-sm text-gray-900 font-mono max-w-xs truncate">
+                              {cmd.command}
+                              {cmd.status !== 'running' && cmd.exit_code !== null && (
+                                <span className={`ml-2 text-xs px-1.5 py-0.5 rounded ${
+                                  cmd.exit_code === 0 ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'
+                                }`}>
+                                  {cmd.exit_code}
+                                </span>
+                              )}
+                            </div>
+                          ))}
+                          {process.commands.length > 2 && (
+                            <div className="text-xs text-gray-500">
+                              +{process.commands.length - 2} more...
+                            </div>
+                          )}
+                        </div>
+                      ) : (
+                        <div className="text-sm text-gray-500 italic">No commands</div>
+                      )}
                       {process.tags && process.tags.length > 0 && (
-                        <div className="flex flex-wrap gap-1 mt-1">
+                        <div className="flex flex-wrap gap-1 mt-2">
                           {process.tags.map((tag, index) => (
                             <span
                               key={index}
@@ -155,10 +199,17 @@ export default function ProcessList() {
                       <div className={`status-badge status-${process.status} flex items-center`}>
                         {getStatusIcon(process.status)}
                         <span className="ml-1 capitalize">{process.status}</span>
-                        {process.exit_code !== null && (
-                          <span className="ml-1">({process.exit_code})</span>
-                        )}
                       </div>
+                      {process.commands && process.commands.length > 1 && (
+                        <div className="text-xs text-gray-500 mt-1">
+                          {process.commands.filter(cmd => cmd.status === 'running').length > 0 && 
+                            `${process.commands.filter(cmd => cmd.status === 'running').length} running`}
+                          {process.commands.filter(cmd => cmd.status === 'completed').length > 0 && 
+                            ` ${process.commands.filter(cmd => cmd.status === 'completed').length} completed`}
+                          {process.commands.filter(cmd => cmd.status === 'failed').length > 0 && 
+                            ` ${process.commands.filter(cmd => cmd.status === 'failed').length} failed`}
+                        </div>
+                      )}
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
                       {formatDistanceToNow(new Date(process.start_time), { addSuffix: true })}

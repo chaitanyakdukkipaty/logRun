@@ -155,10 +155,8 @@ function createTables(callback) {
     CREATE TABLE IF NOT EXISTS processes (
       process_id TEXT PRIMARY KEY,
       name TEXT,
-      command TEXT NOT NULL,
-      pid INTEGER,
+      commands TEXT NOT NULL,  -- JSON array of commands
       status TEXT NOT NULL,
-      exit_code INTEGER,
       start_time DATETIME NOT NULL,
       end_time DATETIME,
       tags TEXT,
@@ -205,7 +203,93 @@ function broadcastLogEntry(processId, logEntry) {
 
 // Health check
 app.get('/health', (req, res) => {
-  res.json({ status: 'OK', timestamp: new Date().toISOString() });
+  // Also clean up any stale running processes
+  const cleanupQuery = `
+    SELECT process_id, commands FROM processes WHERE status = 'running'
+  `;
+  
+  db.all(cleanupQuery, [], (err, rows) => {
+    if (err) {
+      console.error('Error during cleanup:', err);
+      return res.json({ 
+        status: 'OK', 
+        timestamp: new Date().toISOString(),
+        cleanup: 'failed'
+      });
+    }
+
+    let cleanedUp = 0;
+    let processed = 0;
+    const totalRunning = rows.length;
+
+    if (totalRunning === 0) {
+      return res.json({ 
+        status: 'OK', 
+        timestamp: new Date().toISOString(),
+        cleanedUpProcesses: 0,
+        runningProcesses: 0
+      });
+    }
+
+    rows.forEach(row => {
+      const commands = JSON.parse(row.commands || '[]');
+      let needsUpdate = false;
+      let anyRunning = false;
+      let anyFailed = false;
+
+      for (let cmd of commands) {
+        if (cmd.status === 'running' && cmd.pid) {
+          try {
+            process.kill(cmd.pid, 0);
+            anyRunning = true;
+          } catch (e) {
+            cmd.status = 'cancelled';
+            cmd.exit_code = -1;
+            cmd.end_time = new Date().toISOString();
+            needsUpdate = true;
+          }
+        } else if (cmd.status === 'running') {
+          anyRunning = true;
+        } else if (cmd.status === 'failed') {
+          anyFailed = true;
+        }
+      }
+
+      if (needsUpdate) {
+        const processStatus = anyRunning ? 'running' : (anyFailed ? 'failed' : 'cancelled');
+        const processEndTime = anyRunning ? null : new Date().toISOString();
+        
+        const updateQuery = `
+          UPDATE processes SET 
+            commands = ?, status = ?, end_time = COALESCE(?, end_time)
+          WHERE process_id = ?
+        `;
+        
+        db.run(updateQuery, [JSON.stringify(commands), processStatus, processEndTime, row.process_id], () => {
+          cleanedUp++;
+          processed++;
+          if (processed === totalRunning) {
+            res.json({ 
+              status: 'OK', 
+              timestamp: new Date().toISOString(),
+              cleanedUpProcesses: cleanedUp,
+              runningProcesses: totalRunning
+            });
+          }
+        });
+      } else {
+        processed++;
+        if (processed === totalRunning) {
+          res.json({ 
+            status: 'OK', 
+            timestamp: new Date().toISOString(),
+            cleanedUpProcesses: cleanedUp,
+            runningProcesses: totalRunning
+          });
+        }
+      }
+    });
+  });
 });
 
 // Bulk log processing function
@@ -311,53 +395,180 @@ app.post('/processes/:id/logs/batch', (req, res) => {
   });
 });
 
-// Create new process
+// Create new process or add command to existing process
 app.post('/processes', (req, res) => {
   const {
     process_id,
     name,
-    command,
-    pid,
+    commands,  // Now expects commands array
     status,
-    exit_code,
     start_time,
     end_time,
     tags,
     cwd
   } = req.body;
 
-  if (!process_id || !command || !status) {
-    return res.status(400).json({ error: 'Missing required fields: process_id, command, status' });
+  if (!process_id || !commands || !Array.isArray(commands) || !status) {
+    return res.status(400).json({ error: 'Missing required fields: process_id, commands (array), status' });
   }
 
-  const query = `
-    INSERT INTO processes 
-    (process_id, name, command, pid, status, exit_code, start_time, end_time, tags, cwd)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  // Check if process with same name already exists and is running
+  if (name) {
+    db.get('SELECT * FROM processes WHERE name = ? AND status = "running"', [name], (err, existingRow) => {
+      if (err) {
+        console.error('Database error:', err);
+        return res.status(500).json({ error: 'Database error' });
+      }
+
+      if (existingRow) {
+        // Add commands to existing process
+        const existingCommands = JSON.parse(existingRow.commands || '[]');
+        const newCommands = [...existingCommands, ...commands];
+
+        db.run(
+          'UPDATE processes SET commands = ? WHERE process_id = ?',
+          [JSON.stringify(newCommands), existingRow.process_id],
+          function(updateErr) {
+            if (updateErr) {
+              console.error('Database error:', updateErr);
+              return res.status(500).json({ error: 'Database error' });
+            }
+            res.json({ 
+              message: 'Commands added to existing process', 
+              process_id: existingRow.process_id,
+              consolidated: true
+            });
+          }
+        );
+        return;
+      }
+
+      // Create new process
+      createNewProcess();
+    });
+  } else {
+    // No name provided, create new process
+    createNewProcess();
+  }
+
+  function createNewProcess() {
+    const query = `
+      INSERT INTO processes 
+      (process_id, name, commands, status, start_time, end_time, tags, cwd)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `;
+
+    const tagsJson = Array.isArray(tags) ? JSON.stringify(tags) : tags || '[]';
+    const commandsJson = JSON.stringify(commands);
+
+    db.run(query, [
+      process_id,
+      name,
+      commandsJson,
+      status,
+      start_time,
+      end_time,
+      tagsJson,
+      cwd
+    ], function(err) {
+      if (err) {
+        console.error('Database error:', err);
+        return res.status(500).json({ error: 'Database error' });
+      }
+      
+      res.status(201).json({ 
+        message: 'Process created', 
+        process_id: process_id,
+        consolidated: false
+      });
+    });
+  }
+});
+
+// Update specific command in a process (atomic operation)
+app.put('/processes/:id/commands/:commandId', (req, res) => {
+  const processId = req.params.id;
+  const commandId = req.params.commandId;
+  const { status, exit_code, end_time } = req.body;
+
+  // First get the current process
+  const getQuery = `
+    SELECT commands FROM processes WHERE process_id = ?
   `;
 
-  const tagsJson = Array.isArray(tags) ? JSON.stringify(tags) : tags || '[]';
-
-  db.run(query, [
-    process_id,
-    name,
-    command,
-    pid,
-    status,
-    exit_code,
-    start_time,
-    end_time,
-    tagsJson,
-    cwd
-  ], function(err) {
+  db.get(getQuery, [processId], (err, row) => {
     if (err) {
       console.error('Database error:', err);
       return res.status(500).json({ error: 'Database error' });
     }
+
+    if (!row) {
+      return res.status(404).json({ error: 'Process not found' });
+    }
+
+    const commands = JSON.parse(row.commands || '[]');
     
-    res.status(201).json({ 
-      message: 'Process created', 
-      process_id: process_id 
+    // Find and update the specific command
+    let commandFound = false;
+    let anyRunning = false;
+    let anyFailed = false;
+    
+    for (let cmd of commands) {
+      if (cmd.command_id === commandId) {
+        // Update this command
+        cmd.status = status || cmd.status;
+        if (exit_code !== undefined) cmd.exit_code = exit_code;
+        if (end_time) cmd.end_time = end_time;
+        commandFound = true;
+      }
+      
+      // Check overall status
+      if (cmd.status === 'running') {
+        anyRunning = true;
+      } else if (cmd.status === 'failed') {
+        anyFailed = true;
+      }
+    }
+
+    if (!commandFound) {
+      return res.status(404).json({ error: 'Command not found in process' });
+    }
+
+    // Determine overall process status
+    let processStatus = 'running';
+    let processEndTime = null;
+    
+    if (!anyRunning) {
+      // All commands are done
+      processStatus = anyFailed ? 'failed' : 'completed';
+      processEndTime = new Date().toISOString();
+    }
+
+    // Update the process with new commands array and status
+    const updateQuery = `
+      UPDATE processes SET 
+        commands = ?,
+        status = ?,
+        end_time = COALESCE(?, end_time)
+      WHERE process_id = ?
+    `;
+
+    db.run(updateQuery, [
+      JSON.stringify(commands),
+      processStatus,
+      processEndTime,
+      processId
+    ], function(err) {
+      if (err) {
+        console.error('Database error:', err);
+        return res.status(500).json({ error: 'Database error' });
+      }
+
+      res.json({ 
+        message: 'Command updated successfully',
+        process_status: processStatus,
+        commands_count: commands.length 
+      });
     });
   });
 });
@@ -367,10 +578,8 @@ app.put('/processes/:id', (req, res) => {
   const processId = req.params.id;
   const {
     name,
-    command,
-    pid,
+    commands,
     status,
-    exit_code,
     start_time,
     end_time,
     tags,
@@ -380,10 +589,8 @@ app.put('/processes/:id', (req, res) => {
   const query = `
     UPDATE processes SET 
       name = COALESCE(?, name),
-      command = COALESCE(?, command),
-      pid = COALESCE(?, pid),
+      commands = COALESCE(?, commands),
       status = COALESCE(?, status),
-      exit_code = COALESCE(?, exit_code),
       start_time = COALESCE(?, start_time),
       end_time = COALESCE(?, end_time),
       tags = COALESCE(?, tags),
@@ -392,13 +599,12 @@ app.put('/processes/:id', (req, res) => {
   `;
 
   const tagsJson = Array.isArray(tags) ? JSON.stringify(tags) : tags;
+  const commandsJson = Array.isArray(commands) ? JSON.stringify(commands) : commands;
 
   db.run(query, [
     name,
-    command,
-    pid,
+    commandsJson,
     status,
-    exit_code,
     start_time,
     end_time,
     tagsJson,
@@ -424,7 +630,7 @@ app.put('/processes/:id', (req, res) => {
 // Add log entry for a process
 app.post('/processes/:id/logs', async (req, res) => {
   const processId = req.params.id;
-  const { timestamp, stream, message } = req.body;
+  const { timestamp, stream, message, command_id } = req.body;
 
   if (!timestamp || !stream || message === undefined) {
     return res.status(400).json({ error: 'Missing required fields: timestamp, stream, message' });
@@ -433,6 +639,7 @@ app.post('/processes/:id/logs', async (req, res) => {
   const logPath = path.join(LOGS_DIR, `${processId}.log`);
   const logEntry = JSON.stringify({
     process_id: processId,
+    command_id: command_id || '',
     timestamp,
     stream,
     message
@@ -443,7 +650,13 @@ app.post('/processes/:id/logs', async (req, res) => {
     res.status(201).json({ message: 'Log entry added' });
     
     // Broadcast to SSE clients
-    broadcastLogEntry(processId, { process_id: processId, timestamp, stream, message });
+    broadcastLogEntry(processId, { 
+      process_id: processId, 
+      command_id: command_id || '',
+      timestamp, 
+      stream, 
+      message 
+    });
   } catch (error) {
     console.error('Error writing log:', error);
     res.status(500).json({ error: 'Error writing log' });
@@ -454,17 +667,20 @@ app.get('/processes', (req, res) => {
     SELECT 
       process_id,
       name,
-      command,
-      pid,
+      commands,
       status,
-      exit_code,
       start_time,
       end_time,
       tags,
       cwd,
       created_at
     FROM processes 
-    ORDER BY start_time DESC
+    ORDER BY 
+      CASE 
+        WHEN status = 'running' THEN 0 
+        ELSE 1 
+      END,
+      start_time DESC
   `;
 
   db.all(query, [], (err, rows) => {
@@ -475,6 +691,7 @@ app.get('/processes', (req, res) => {
 
     const processes = rows.map(row => ({
       ...row,
+      commands: JSON.parse(row.commands || '[]'),
       tags: JSON.parse(row.tags || '[]'),
       start_time: new Date(row.start_time),
       end_time: row.end_time ? new Date(row.end_time) : null,
@@ -487,6 +704,52 @@ app.get('/processes', (req, res) => {
   });
 });
 
+// Get process by name (for consolidation checks)
+app.get('/processes/by-name/:name', (req, res) => {
+  const name = req.params.name;
+  
+  const query = `
+    SELECT 
+      process_id,
+      name,
+      commands,
+      status,
+      start_time,
+      end_time,
+      tags,
+      cwd,
+      created_at
+    FROM processes 
+    WHERE name = ? AND status = 'running'
+    ORDER BY start_time DESC
+    LIMIT 1
+  `;
+
+  db.get(query, [name], (err, row) => {
+    if (err) {
+      console.error('Database error:', err);
+      return res.status(500).json({ error: 'Database error' });
+    }
+
+    if (!row) {
+      return res.status(404).json({ error: 'Process not found' });
+    }
+
+    const process = {
+      ...row,
+      commands: JSON.parse(row.commands || '[]'),
+      tags: JSON.parse(row.tags || '[]'),
+      start_time: new Date(row.start_time),
+      end_time: row.end_time ? new Date(row.end_time) : null,
+      duration: row.end_time ? 
+        (new Date(row.end_time) - new Date(row.start_time)) / 1000 : 
+        (Date.now() - new Date(row.start_time)) / 1000
+    };
+
+    res.json(process);
+  });
+});
+
 // Get specific process
 app.get('/processes/:id', (req, res) => {
   const processId = req.params.id;
@@ -495,10 +758,8 @@ app.get('/processes/:id', (req, res) => {
     SELECT 
       process_id,
       name,
-      command,
-      pid,
+      commands,
       status,
-      exit_code,
       start_time,
       end_time,
       tags,
@@ -520,6 +781,7 @@ app.get('/processes/:id', (req, res) => {
 
     const process = {
       ...row,
+      commands: JSON.parse(row.commands || '[]'),
       tags: JSON.parse(row.tags || '[]'),
       start_time: new Date(row.start_time),
       end_time: row.end_time ? new Date(row.end_time) : null,
@@ -537,7 +799,7 @@ app.get('/processes/:id/health', (req, res) => {
   const processId = req.params.id;
   
   const query = `
-    SELECT pid, status, start_time, end_time
+    SELECT commands, status, start_time, end_time
     FROM processes 
     WHERE process_id = ?
   `;
@@ -554,43 +816,94 @@ app.get('/processes/:id/health', (req, res) => {
 
     let isHealthy = true;
     let reason = '';
+    let deadCommands = [];
 
-    // If process is marked as running, check if it's actually alive
-    if (row.status === 'running' && row.pid) {
-      try {
-        // Check if process is still running by sending signal 0 (doesn't kill, just checks)
-        process.kill(row.pid, 0);
-      } catch (error) {
-        // Process doesn't exist anymore
-        isHealthy = false;
-        reason = 'Process no longer exists';
-        
-        // Auto-update the process status
-        const updateQuery = `
-          UPDATE processes 
-          SET status = 'terminated', end_time = datetime('now') 
-          WHERE process_id = ?
-        `;
-        
-        db.run(updateQuery, [processId], (updateErr) => {
-          if (updateErr) {
-            console.error('Failed to update stale process:', updateErr);
-          } else {
-            console.log(`Auto-updated stale process ${processId} to terminated`);
-          }
-        });
+    // If process is already completed/failed/cancelled, it's healthy
+    if (row.status !== 'running') {
+      return res.json({
+        process_id: processId,
+        status: row.status,
+        is_healthy: true,
+        reason: `Process is ${row.status}`,
+        start_time: row.start_time,
+        end_time: row.end_time
+      });
+    }
+
+    const commands = JSON.parse(row.commands || '[]');
+    let needsUpdate = false;
+    let anyRunning = false;
+    let anyFailed = false;
+
+    // Check each command's PID
+    for (let cmd of commands) {
+      if (cmd.status === 'running' && cmd.pid) {
+        try {
+          // Check if process is still running by sending signal 0 (doesn't kill, just checks)
+          process.kill(cmd.pid, 0);
+          anyRunning = true;
+        } catch (error) {
+          // Process doesn't exist anymore - mark as cancelled
+          cmd.status = 'cancelled';
+          cmd.exit_code = -1;
+          cmd.end_time = new Date().toISOString();
+          deadCommands.push(cmd.pid);
+          needsUpdate = true;
+          isHealthy = false;
+        }
+      } else if (cmd.status === 'running') {
+        anyRunning = true;
+      } else if (cmd.status === 'failed') {
+        anyFailed = true;
       }
     }
 
-    res.json({
-      process_id: processId,
-      status: row.status,
-      pid: row.pid,
-      is_healthy: isHealthy,
-      reason: reason,
-      start_time: row.start_time,
-      end_time: row.end_time
-    });
+    if (needsUpdate) {
+      // Determine overall process status
+      let processStatus = 'running';
+      let processEndTime = null;
+      
+      if (!anyRunning) {
+        processStatus = anyFailed ? 'failed' : 'cancelled';
+        processEndTime = new Date().toISOString();
+      }
+
+      // Auto-update the process status
+      const updateQuery = `
+        UPDATE processes 
+        SET commands = ?, status = ?, end_time = COALESCE(?, end_time)
+        WHERE process_id = ?
+      `;
+      
+      db.run(updateQuery, [JSON.stringify(commands), processStatus, processEndTime, processId], (updateErr) => {
+        if (updateErr) {
+          console.error('Failed to update stale process:', updateErr);
+          reason = `Found ${deadCommands.length} dead commands but failed to update`;
+        } else {
+          console.log(`Auto-updated stale process ${processId} to ${processStatus}`);
+          reason = `Found ${deadCommands.length} dead commands, updated to ${processStatus}`;
+        }
+
+        res.json({
+          process_id: processId,
+          status: processStatus,
+          is_healthy: isHealthy,
+          reason: reason,
+          dead_commands: deadCommands,
+          start_time: row.start_time,
+          end_time: processEndTime || row.end_time
+        });
+      });
+    } else {
+      res.json({
+        process_id: processId,
+        status: row.status,
+        is_healthy: isHealthy,
+        reason: isHealthy ? 'All commands are running properly' : reason,
+        start_time: row.start_time,
+        end_time: row.end_time
+      });
+    }
   });
 });
 
