@@ -40,7 +40,29 @@ A CLI + Web UI system for wrapping shell commands and Kubernetes pod logs with c
 curl -sSL https://raw.githubusercontent.com/chaitanyakdukkipaty/logRun/main/install.sh | bash
 ```
 
-Or [download the latest release](https://github.com/chaitanyakdukkipaty/logRun/releases/latest) for your platform.
+Or [download the latest release](https://github.com/chaitanyakdukkipaty/logRun/releases/latest) for your platform and extract the binary to a directory on your `PATH`.
+
+**Debug mode** (verbose output if install fails):
+```bash
+DEBUG=true curl -sSL https://raw.githubusercontent.com/chaitanyakdukkipaty/logRun/main/install.sh | bash
+```
+
+### Uninstall
+
+```bash
+curl -sSL https://raw.githubusercontent.com/chaitanyakdukkipaty/logRun/main/uninstall.sh | bash
+```
+
+This will:
+1. Stop any running LogRun API / web processes
+2. Remove the `logrun` binary from `/usr/local/bin`
+3. Remove `.logrun-services.json` and `logrun.db` from the current directory
+4. Leave `./logs/` in place (remove manually if no longer needed)
+
+**Keep your data** (remove binary only):
+```bash
+KEEP_DATA=true curl -sSL https://raw.githubusercontent.com/chaitanyakdukkipaty/logRun/main/uninstall.sh | bash
+```
 
 ### Build from source
 
