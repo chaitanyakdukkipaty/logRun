@@ -40,7 +40,6 @@ Thumbs.db
 *~
 
 # Go
-go.sum
 vendor/
 
 # Temporary files
