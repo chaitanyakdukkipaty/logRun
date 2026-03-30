@@ -33,6 +33,9 @@ jobs:
         npm install
         npm run build
         cd ..
+        # Copy to cmd/logrun/web/dist/ so //go:embed finds the files
+        rm -rf cmd/logrun/web/dist
+        cp -r web/dist cmd/logrun/web/dist
 
     - name: Build all platforms
       run: |

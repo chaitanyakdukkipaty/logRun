@@ -20,6 +20,12 @@ npm run build
 cd ..
 echo "✅ Web UI built -> web/dist/"
 
+# Copy built assets into cmd/logrun/web/dist/ so //go:embed finds them.
+echo "📋 Copying web assets to cmd/logrun/web/dist/..."
+rm -rf cmd/logrun/web/dist
+cp -r web/dist cmd/logrun/web/dist
+echo "✅ Assets copied -> cmd/logrun/web/dist/"
+
 # ── Step 2: Build Go CLI (embeds web/dist at compile time) ────────────────────
 if [ "$BUILD_ALL_PLATFORMS" = "true" ]; then
     echo "📦 Building Go CLI for all platforms..."
