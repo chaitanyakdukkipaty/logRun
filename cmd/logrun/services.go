@@ -26,6 +26,7 @@ Port      int    `json:"port"`
 PID       int    `json:"pid"`
 APITunnel string `json:"api_tunnel,omitempty"`
 WebTunnel string `json:"web_tunnel,omitempty"`
+TunnelPID int    `json:"tunnel_pid,omitempty"`
 UpdatedAt string `json:"updated_at"`
 }
 

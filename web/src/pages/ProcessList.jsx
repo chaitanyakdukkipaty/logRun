@@ -63,10 +63,14 @@ export default function ProcessList() {
     }
   }
 
-  const formatDuration = (seconds) => {
-    if (seconds < 60) return `${Math.round(seconds)}s`
-    if (seconds < 3600) return `${Math.round(seconds / 60)}m`
-    return `${Math.round(seconds / 3600)}h`
+  const formatDuration = (process) => {
+    const start = process.start_time ? new Date(process.start_time) : null
+    if (!start) return '—'
+    const end = process.end_time ? new Date(process.end_time) : new Date()
+    const seconds = Math.max(0, Math.floor((end - start) / 1000))
+    if (seconds < 60) return `${seconds}s`
+    if (seconds < 3600) return `${Math.floor(seconds / 60)}m`
+    return `${Math.floor(seconds / 3600)}h`
   }
 
   if (isLoading) {
@@ -224,7 +228,7 @@ export default function ProcessList() {
                       {formatDistanceToNow(new Date(process.start_time), { addSuffix: true })}
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                      {formatDuration(process.duration)}
+                      {formatDuration(process)}
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
                       <div className="flex items-center justify-end space-x-2">

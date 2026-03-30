@@ -32,21 +32,28 @@ type tunnelProcs struct {
 	apiProc *exec.Cmd
 	webProc *exec.Cmd
 	baseDir string
+	reused  bool // true when we reused an existing tunnel (don't kill or clear state)
 }
 
 // kill terminates tunnel processes and clears their URLs from the state file.
+// If the tunnel was reused (started by another process), this is a no-op.
 func (tp *tunnelProcs) kill() {
 	if tp == nil {
+		return
+	}
+	if tp.reused {
+		// Another process owns this tunnel — leave it alone.
 		return
 	}
 	fmt.Println("\nStopping tunnel…")
 	if tp.apiProc != nil {
 		tp.apiProc.Process.Kill()
 	}
-	// Clear tunnel URLs from state file.
+	// Clear tunnel URLs and PID from state file.
 	state := loadServiceState()
 	state.APITunnel = ""
 	state.WebTunnel = ""
+	state.TunnelPID = 0
 	saveServiceState(state)
 	fmt.Println("Tunnel stopped.")
 }
@@ -54,11 +61,28 @@ func (tp *tunnelProcs) kill() {
 // startTunnelsAndPrint establishes a single tunnel (API + web on same port),
 // prints the public URL, persists it to the state file, and returns the process
 // for later cleanup. Blocks only until the tunnel is ready (or returns an error).
+// If a tunnel URL is already stored in the state file and its owning process is
+// still alive, the existing URL is reused without spawning a new process.
 func startTunnelsAndPrint(apiPort, _ int) (*tunnelProcs, error) {
 	// Always use the authoritative port from the state file if healthy.
 	state := loadServiceState()
 	if state.Port > 0 && isServerHealthy(state.Port) {
 		apiPort = state.Port
+	}
+
+	// ── Reuse existing tunnel if still alive ─────────────────────────────────
+	if state.APITunnel != "" && state.TunnelPID > 0 {
+		if isProcessAlive(state.TunnelPID) {
+			fmt.Printf("\nUsing existing tunnel (owned by PID %d):\n", state.TunnelPID)
+			fmt.Printf("  ✓ Tunnel: %s\n", state.APITunnel)
+			fmt.Printf("\nShare this with your team:\n  🌐 Dashboard + API: %s\n\n", state.APITunnel)
+			return &tunnelProcs{reused: true}, nil
+		}
+		// Stale entry — process is gone; clear and start fresh.
+		state.APITunnel = ""
+		state.WebTunnel = ""
+		state.TunnelPID = 0
+		saveServiceState(state)
 	}
 
 	tool, err := detectTunnelTool()
@@ -74,10 +98,13 @@ func startTunnelsAndPrint(apiPort, _ int) (*tunnelProcs, error) {
 	}
 	fmt.Printf("  ✓ Tunnel: %s\n", tunnelURL)
 
-	// Persist tunnel URL to state file.
+	// Persist tunnel URL and PID to state file.
 	state = loadServiceState()
 	state.APITunnel = tunnelURL
 	state.WebTunnel = tunnelURL // same URL serves web UI too
+	if proc != nil && proc.Process != nil {
+		state.TunnelPID = proc.Process.Pid
+	}
 	saveServiceState(state)
 
 	fmt.Printf("\nShare this with your team:\n  🌐 Dashboard + API: %s\n\n", tunnelURL)

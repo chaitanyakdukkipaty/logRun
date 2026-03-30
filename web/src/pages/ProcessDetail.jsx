@@ -327,10 +327,14 @@ export default function ProcessDetail() {
     )
   }
 
-  const formatDuration = (seconds) => {
-    if (seconds < 60) return `${Math.round(seconds)}s`
-    if (seconds < 3600) return `${Math.round(seconds / 60)}m`
-    return `${Math.round(seconds / 3600)}h`
+  const formatDuration = (proc) => {
+    const start = proc?.start_time ? new Date(proc.start_time) : null
+    if (!start) return '—'
+    const end = proc?.end_time ? new Date(proc.end_time) : new Date()
+    const seconds = Math.max(0, Math.floor((end - start) / 1000))
+    if (seconds < 60) return `${seconds}s`
+    if (seconds < 3600) return `${Math.floor(seconds / 60)}m`
+    return `${Math.floor(seconds / 3600)}h`
   }
 
   return (
@@ -372,7 +376,7 @@ export default function ProcessDetail() {
             <h3 className="text-sm font-medium text-gray-500 mb-2">Duration</h3>
             <div className="flex items-center text-gray-900">
               <Clock className="h-4 w-4 mr-1" />
-              {formatDuration(process.duration)}
+              {formatDuration(process)}
             </div>
           </div>
 

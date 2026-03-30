@@ -955,18 +955,7 @@ func buildProcessMap(processID, name, commandsJSON, status, startTime, endTime, 
 		p["end_time"] = endTime
 	}
 
-	// Compute duration in seconds.
-	st, err := time.Parse(time.RFC3339, startTime)
-	if err == nil {
-		end := time.Now()
-		if endTime != "" {
-			if et, err := time.Parse(time.RFC3339, endTime); err == nil {
-				end = et
-			}
-		}
-		p["duration"] = end.Sub(st).Seconds()
-	}
-
+	// Return start_time and end_time; clients compute duration client-side.
 	return p
 }
 
