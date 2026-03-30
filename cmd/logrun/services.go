@@ -10,7 +10,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
-	"syscall"
 	"time"
 )
 
@@ -143,7 +142,7 @@ func startAPIService(port int, baseDir string) error {
 	cmd.Env = append(os.Environ(), fmt.Sprintf("PORT=%d", port))
 	cmd.Stdout = logOut
 	cmd.Stderr = logOut
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	cmd.SysProcAttr = detachedSysProcAttr()
 	return cmd.Start()
 }
 
@@ -219,7 +218,7 @@ func startWebService(webPort, apiPort int, baseDir string) error {
 	)
 	cmd.Stdout = logOut
 	cmd.Stderr = logOut
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	cmd.SysProcAttr = detachedSysProcAttr()
 	return cmd.Start()
 }
 

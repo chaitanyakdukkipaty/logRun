@@ -164,7 +164,7 @@ func startTunnel(tool tunnelTool, port int) (string, *exec.Cmd, error) {
 func startZrokTunnel(port int) (string, *exec.Cmd, error) {
 	target := fmt.Sprintf("http://localhost:%d", port)
 	cmd := exec.Command("zrok", "share", "public", "--headless", target)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	cmd.SysProcAttr = detachedSysProcAttr()
 
 	// zrok writes its share URL in a JSON log line to stderr.
 	stdout, err := cmd.StdoutPipe()
@@ -264,7 +264,7 @@ func extractZrokURL(line string) string {
 func startNgrokTunnel(port int) (string, *exec.Cmd, error) {
 	cmd := exec.Command("ngrok", "http", fmt.Sprintf("%d", port),
 		"--log=stdout", "--log-format=json")
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	cmd.SysProcAttr = detachedSysProcAttr()
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
