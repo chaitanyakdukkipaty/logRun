@@ -119,7 +119,7 @@ exit codes, and timestamps. Provides a web interface for log viewing and search.
 	rootCmd.Flags().StringArrayVar(&env, "env", []string{}, "Inject environment variables (KEY=VALUE)")
 	rootCmd.Flags().BoolVar(&detach, "detach", false, "Run in background")
 	rootCmd.Flags().BoolVar(&follow, "follow", true, "Stream logs live to stdout")
-	rootCmd.Flags().StringVar(&apiURL, "api-url", "http://localhost:3001", "LogRun API server URL")
+	rootCmd.Flags().StringVar(&apiURL, "api-url", fmt.Sprintf("http://localhost:%d", preferredPort), "LogRun server URL")
 	rootCmd.Flags().BoolVar(&share, "share", false, "Expose API and web via zrok/ngrok tunnel for team sharing")
 
 	rootCmd.AddCommand(kubectlCmd)
@@ -131,43 +131,34 @@ exit codes, and timestamps. Provides a web interface for log viewing and search.
 	}
 }
 
-// shareCmd exposes API + web via a tunnel and blocks until Ctrl+C.
+// shareCmd exposes the embedded server via a tunnel and blocks until Ctrl+C.
 var shareCmd = &cobra.Command{
 	Use:   "share",
-	Short: "Expose LogRun API and web UI via zrok/ngrok for team sharing",
-	Long: `Start the LogRun API and web services (if not running), then create
-public tunnels via zrok or ngrok so anyone on your team can view your logs.
+	Short: "Expose LogRun via zrok/ngrok for team sharing",
+	Long: `Start the LogRun server (if not running), then create a public tunnel
+via zrok or ngrok so anyone on your team can view your logs.
 
-Blocks until Ctrl+C. Tunnel URLs are printed on startup.
+Blocks until Ctrl+C. Tunnel URL is printed on startup.
 
 Examples:
   logrun share
   logrun share --api-url http://localhost:4000`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		var apiPort, webPort int
+		var port int
 		if cmd.Flags().Changed("api-url") {
-			// Parse the port out of the explicit --api-url value.
 			runner.apiBaseURL = apiURL
-			apiPort = parsePortFromURL(apiURL, preferredAPIPort)
-			// Web port comes from state file (or default).
-			if baseDir, err := findProjectRoot(); err == nil {
-				state := loadServiceState(baseDir)
-				webPort = state.WebPort
-			}
-			if webPort == 0 {
-				webPort = preferredWebPort
-			}
+			port = parsePortFromURL(apiURL, preferredPort)
 		} else {
-			apiPort, webPort = ensureServicesRunning()
-			runner.apiBaseURL = fmt.Sprintf("http://localhost:%d", apiPort)
+			port = ensureServerRunning()
+			runner.apiBaseURL = fmt.Sprintf("http://localhost:%d", port)
 		}
-		return runShare(apiPort, webPort)
+		return runShare(port, port) // single port for both API and web
 	},
 }
 
 func init() {
 	var err error
-	runner, err = NewLogRunner("http://localhost:3001") // Default API URL
+	runner, err = NewLogRunner(fmt.Sprintf("http://localhost:%d", preferredPort))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to initialize LogRunner: %v\n", err)
 		os.Exit(1)
@@ -214,20 +205,19 @@ func runCommand(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("no command specified")
 	}
 
-	// Auto-start API + web unless the user explicitly supplied --api-url.
-	var apiPort, webPort int
+	// Auto-start embedded server unless the user explicitly supplied --api-url.
+	var port int
 	if !cmd.Flags().Changed("api-url") {
-		apiPort, webPort = ensureServicesRunning()
-		runner.apiBaseURL = fmt.Sprintf("http://localhost:%d", apiPort)
+		port = ensureServerRunning()
+		runner.apiBaseURL = fmt.Sprintf("http://localhost:%d/api", port)
 	} else {
 		runner.apiBaseURL = apiURL
-		apiPort = preferredAPIPort
-		webPort = preferredWebPort
+		port = parsePortFromURL(apiURL, preferredPort)
 	}
 
-	// If --share is set, start tunnels synchronously so URLs are shown before the command runs.
+	// If --share is set, start tunnel synchronously so URL is shown before the command runs.
 	if share {
-		if tp, err := startTunnelsAndPrint(apiPort, webPort); err != nil {
+		if tp, err := startTunnelsAndPrint(port, port); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: tunnel error: %v\n", err)
 		} else {
 			defer tp.kill()

@@ -34,40 +34,31 @@ type tunnelProcs struct {
 	baseDir string
 }
 
-// kill terminates both tunnel processes and clears their URLs from the state file.
+// kill terminates tunnel processes and clears their URLs from the state file.
 func (tp *tunnelProcs) kill() {
 	if tp == nil {
 		return
 	}
-	fmt.Println("\nStopping tunnels…")
+	fmt.Println("\nStopping tunnel…")
 	if tp.apiProc != nil {
 		tp.apiProc.Process.Kill()
 	}
-	if tp.webProc != nil {
-		tp.webProc.Process.Kill()
-	}
-	if tp.baseDir != "" {
-		state := loadServiceState(tp.baseDir)
-		state.APITunnel = ""
-		state.WebTunnel = ""
-		saveServiceState(tp.baseDir, state)
-	}
-	fmt.Println("Tunnels stopped.")
+	// Clear tunnel URLs from state file.
+	state := loadServiceState()
+	state.APITunnel = ""
+	state.WebTunnel = ""
+	saveServiceState(state)
+	fmt.Println("Tunnel stopped.")
 }
 
-// startTunnelsAndPrint establishes both tunnels, prints their public URLs,
-// persists them to the state file, and returns the processes for later cleanup.
-// Blocks only until both tunnels are ready (or returns an error).
-func startTunnelsAndPrint(apiPort, webPort int) (*tunnelProcs, error) {
-	baseDir, _ := findProjectRoot()
-	if baseDir != "" {
-		state := loadServiceState(baseDir)
-		if state.APIPort > 0 && isAPIHealthy(state.APIPort) {
-			apiPort = state.APIPort
-		}
-		if state.WebPort > 0 && isWebHealthy(state.WebPort) {
-			webPort = state.WebPort
-		}
+// startTunnelsAndPrint establishes a single tunnel (API + web on same port),
+// prints the public URL, persists it to the state file, and returns the process
+// for later cleanup. Blocks only until the tunnel is ready (or returns an error).
+func startTunnelsAndPrint(apiPort, _ int) (*tunnelProcs, error) {
+	// Always use the authoritative port from the state file if healthy.
+	state := loadServiceState()
+	if state.Port > 0 && isServerHealthy(state.Port) {
+		apiPort = state.Port
 	}
 
 	tool, err := detectTunnelTool()
@@ -75,47 +66,36 @@ func startTunnelsAndPrint(apiPort, webPort int) (*tunnelProcs, error) {
 		return nil, err
 	}
 
-	fmt.Println("\nStarting tunnels…")
+	fmt.Println("\nStarting tunnel…")
 
-	apiURL, apiProc, err := startTunnel(tool, apiPort)
+	tunnelURL, proc, err := startTunnel(tool, apiPort)
 	if err != nil {
-		return nil, fmt.Errorf("could not start API tunnel: %w", err)
+		return nil, fmt.Errorf("could not start tunnel: %w", err)
 	}
-	fmt.Printf("  ✓ API tunnel: %s\n", apiURL)
+	fmt.Printf("  ✓ Tunnel: %s\n", tunnelURL)
 
-	webURL, webProc, err := startTunnel(tool, webPort)
-	if err != nil {
-		apiProc.Process.Kill()
-		return nil, fmt.Errorf("could not start Web tunnel: %w", err)
-	}
-	fmt.Printf("  ✓ Web tunnel: %s\n", webURL)
+	// Persist tunnel URL to state file.
+	state = loadServiceState()
+	state.APITunnel = tunnelURL
+	state.WebTunnel = tunnelURL // same URL serves web UI too
+	saveServiceState(state)
 
-	if baseDir != "" {
-		state := loadServiceState(baseDir)
-		state.APITunnel = apiURL
-		state.WebTunnel = webURL
-		saveServiceState(baseDir, state)
-	}
+	fmt.Printf("\nShare this with your team:\n  🌐 Dashboard + API: %s\n\n", tunnelURL)
 
-	fmt.Printf("\nShare this with your team:\n  🌐 Dashboard: %s\n  📡 API:       %s\n\n", webURL, apiURL)
-
-	return &tunnelProcs{apiProc: apiProc, webProc: webProc, baseDir: baseDir}, nil
+	baseDir := logrunDir()
+	return &tunnelProcs{apiProc: proc, webProc: proc, baseDir: baseDir}, nil
 }
 
 // runShare is the entry point for `logrun share` standalone subcommand.
-// It starts tunnels, prints URLs, then blocks until Ctrl+C.
-func runShare(apiPort, webPort int) error {
-	tp, err := startTunnelsAndPrint(apiPort, webPort)
+func runShare(apiPort, _ int) error {
+	tp, err := startTunnelsAndPrint(apiPort, apiPort)
 	if err != nil {
 		return err
 	}
-
 	fmt.Println("Press Ctrl+C to stop sharing.")
-
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	<-sigChan
-
 	tp.kill()
 	return nil
 }

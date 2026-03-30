@@ -9,29 +9,58 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    
+
     steps:
     - uses: actions/checkout@v4
-    
+
     - name: Set up Go
       uses: actions/setup-go@v4
       with:
         go-version: '1.21'
-    
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
     - name: Get version
       id: version
       run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-    
+
+    - name: Build web UI (required for go:embed)
+      run: |
+        cd web
+        npm install
+        npm run build
+        cd ..
+
     - name: Build all platforms
       run: |
         chmod +x build.sh
-        ./build.sh ${{ steps.version.outputs.VERSION }} true
-    
+        # Web is already built above; skip the npm steps in build.sh
+        # by invoking go build directly for each platform
+        mkdir -p dist
+        VERSION=${{ steps.version.outputs.VERSION }}
+        for platform in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
+          GOOS=${platform%/*}
+          GOARCH=${platform#*/}
+          output="dist/logrun-${VERSION}-${GOOS}-${GOARCH}"
+          [ "$GOOS" = "windows" ] && output="${output}.exe"
+          echo "Building $GOOS/$GOARCH..."
+          cd cmd/logrun
+          GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="-s -w -X main.version=${VERSION}" -o "../../${output}" .
+          cd ../..
+        done
+        cd dist
+        for f in logrun-*-windows-*.exe; do zip "${f%.exe}.zip" "$f" && rm "$f"; done
+        for f in logrun-*-linux-* logrun-*-darwin-*; do tar -czf "${f}.tar.gz" "$f" && rm "$f"; done
+        ls -la
+
     - name: Generate checksums
       run: |
         cd dist
         sha256sum * > checksums.txt
-    
+
     - name: Create Release
       uses: softprops/action-gh-release@v1
       with:

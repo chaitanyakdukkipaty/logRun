@@ -1,6 +1,7 @@
 #!/bin/bash
 
 # Build script for LogRun project
+# The web UI MUST be built before Go so //go:embed web/dist/* finds the files.
 set -e
 
 VERSION=${1:-"dev"}
@@ -11,13 +12,21 @@ echo "🚀 Building LogRun v$VERSION..."
 # Create bin and dist directories
 mkdir -p bin dist
 
+# ── Step 1: Build Web UI (must come before Go build for go:embed) ─────────────
+echo "📦 Building Web UI (required for binary embedding)..."
+cd web
+npm install --silent
+npm run build
+cd ..
+echo "✅ Web UI built -> web/dist/"
+
+# ── Step 2: Build Go CLI (embeds web/dist at compile time) ────────────────────
 if [ "$BUILD_ALL_PLATFORMS" = "true" ]; then
-    echo "📦 Building for multiple platforms..."
-    
-    # Cross-compilation for distribution
+    echo "📦 Building Go CLI for all platforms..."
+
     platforms=(
         "linux/amd64"
-        "linux/arm64" 
+        "linux/arm64"
         "darwin/amd64"
         "darwin/arm64"
         "windows/amd64"
@@ -27,26 +36,24 @@ if [ "$BUILD_ALL_PLATFORMS" = "true" ]; then
         platform_split=(${platform//\// })
         GOOS=${platform_split[0]}
         GOARCH=${platform_split[1]}
-        
+
         output_name="logrun-$VERSION-$GOOS-$GOARCH"
         if [ $GOOS = "windows" ]; then
             output_name+='.exe'
         fi
-        
-        echo "Building for $GOOS/$GOARCH..."
-        
+
+        echo "  Building $GOOS/$GOARCH..."
         cd cmd/logrun
         GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="-s -w -X main.version=$VERSION" -o "../../dist/$output_name" .
         cd ../..
-        
-        # Create compressed archives
+
         if [ $GOOS = "windows" ]; then
             (cd dist && zip "logrun-$VERSION-$GOOS-$GOARCH.zip" "$output_name" && rm "$output_name")
         else
             (cd dist && tar -czf "logrun-$VERSION-$GOOS-$GOARCH.tar.gz" "$output_name" && rm "$output_name")
         fi
     done
-    
+
     echo "✅ Cross-platform builds complete in dist/"
     ls -la dist/
 else
@@ -55,25 +62,14 @@ else
     go mod tidy
     go build -ldflags="-s -w -X main.version=$VERSION" -o ../../bin/logrun .
     cd ../..
-    echo "✅ CLI built successfully -> bin/logrun"
+    echo "✅ CLI built -> bin/logrun"
 fi
 
-echo "📦 Installing API dependencies..."
-cd api
-npm install
-cd ..
-echo "✅ API dependencies installed"
-
-echo "📦 Building Web UI..."
-cd web
-npm install
-npm run build
-cd ..
-echo "✅ Web UI built successfully -> web/dist"
-
-echo "🎉 Build completed successfully!"
+echo ""
+echo "🎉 Build complete! The binary is self-contained — no Node.js or repo required."
 echo ""
 echo "Quick start:"
-echo "1. Start API:    cd api && npm start"
-echo "2. Start Web UI: cd web && npm run preview"
-echo "3. Use CLI:      ./bin/logrun [command]"
+echo "  ./bin/logrun --help"
+echo "  ./bin/logrun echo 'hello world'"
+echo ""
+echo "Web UI available at http://localhost:4000 after first run."

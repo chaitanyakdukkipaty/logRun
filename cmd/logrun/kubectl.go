@@ -69,7 +69,7 @@ func init() {
 	f.BoolVar(&kubectlFlags.allNamespaces, "all-namespaces", false, "Search pods across all namespaces")
 	f.StringVar(&kubectlName, "name", "", "Friendly process name (default: kubectl/<namespace>/<pattern>)")
 	f.StringVar(&kubectlTags, "tags", "", "Comma-separated tags")
-	f.StringVar(&kubectlAPIURL, "api-url", "http://localhost:3001", "LogRun API server URL")
+	f.StringVar(&kubectlAPIURL, "api-url", fmt.Sprintf("http://localhost:%d", preferredPort), "LogRun server URL")
 	f.BoolVar(&kubectlShare, "share", false, "Expose LogRun via zrok/ngrok for team sharing")
 
 	// Allow --tail without a value (means "last 100 lines").
@@ -78,28 +78,24 @@ func init() {
 
 // runKubectl is the main entry point for the kubectl subcommand.
 func runKubectl(cmd *cobra.Command, args []string) error {
-	// Auto-start API + web unless the user explicitly supplied --api-url.
-	var apiPort, webPort int
+	// Auto-start embedded server unless the user explicitly supplied --api-url.
+	var apiPort int
 	if !cmd.Flags().Changed("api-url") {
-		apiPort, webPort = ensureServicesRunning()
-		runner.apiBaseURL = fmt.Sprintf("http://localhost:%d", apiPort)
+		apiPort = ensureServerRunning()
+		runner.apiBaseURL = fmt.Sprintf("http://localhost:%d/api", apiPort)
 	} else {
 		runner.apiBaseURL = kubectlAPIURL
-		apiPort = parsePortFromURL(kubectlAPIURL, preferredAPIPort)
-		webPort = preferredWebPort
+		apiPort = parsePortFromURL(kubectlAPIURL, preferredPort)
 	}
 
 	// Start tunnels synchronously if --share was requested so URLs are shown
 	// before the interactive prompts begin.
-	// NOTE: tunnels are NOT deferred here — they stay alive after log fetching
-	// so teammates can browse the dashboard. We block on Ctrl+C at the end.
 	var tp *tunnelProcs
 	if kubectlShare {
 		var tunnelErr error
-		tp, tunnelErr = startTunnelsAndPrint(apiPort, webPort)
+		tp, tunnelErr = startTunnelsAndPrint(apiPort, apiPort) // single port
 		if tunnelErr != nil {
 			fmt.Fprintf(os.Stderr, "tunnel error: %v\n", tunnelErr)
-			// Non-fatal — continue without sharing.
 		}
 	}
 
