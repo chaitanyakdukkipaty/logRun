@@ -461,6 +461,9 @@ func runCommand(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(os.Stderr, "Warning: Failed to update command status: %v\n", updateErr)
 	}
 
+	// Drain the log queue before exiting so no buffered entries are lost.
+	WaitForQueueDrain(5 * time.Second)
+
 	fmt.Printf("Command %s in process %s completed with exit code %d\n", commandID, processID, exitCode)
 	return nil
 }

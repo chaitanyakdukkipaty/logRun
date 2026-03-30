@@ -72,6 +72,9 @@ func StartEmbeddedServer(port int) error {
 		return fmt.Errorf("could not initialise schema: %w", err)
 	}
 
+	// Start the log queue workers (in-memory queue + overflow to disk).
+	initLogQueue(dataDir)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", withCORS(handleHealth))
 	mux.HandleFunc("/health/queue", withCORS(handleHealthQueue))
@@ -190,9 +193,15 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleHealthQueue(w http.ResponseWriter, r *http.Request) {
+	stats := getQueueStats()
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"status":     "OK",
-		"queueDepth": 0,
+		"status":        "OK",
+		"depth":         stats.Depth,
+		"capacity":      stats.Capacity,
+		"processed":     stats.Processed,
+		"overflowed":    stats.Overflowed,
+		"dropped":       stats.Dropped,
+		"overflow_files": stats.OverflowFiles,
 	})
 }
 
@@ -600,12 +609,8 @@ func handlePostLog(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	entry["process_id"] = id
 
-	if err := appendLogEntry(id, entry); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-	broadcastSSE(id, entry)
-	writeJSON(w, http.StatusCreated, map[string]string{"message": "Log entry added"})
+	enqueueLog(id, entry)
+	writeJSON(w, http.StatusCreated, map[string]string{"message": "Log entry queued"})
 }
 
 func handlePostLogBatch(w http.ResponseWriter, r *http.Request, id string) {
@@ -627,19 +632,17 @@ func handlePostLogBatch(w http.ResponseWriter, r *http.Request, id string) {
 			entry["timestamp"] = time.Now().UTC().Format(time.RFC3339Nano)
 		}
 		entry["process_id"] = id
-		if err := appendLogEntry(id, entry); err != nil {
-			rejected++
-			continue
-		}
-		broadcastSSE(id, entry)
+		enqueueLog(id, entry)
 		accepted++
 	}
 
+	stats := getQueueStats()
 	writeJSON(w, http.StatusAccepted, map[string]interface{}{
-		"message":    "Logs queued",
-		"accepted":   accepted,
-		"rejected":   rejected,
-		"queueDepth": 0,
+		"message":       "Logs queued",
+		"accepted":      accepted,
+		"rejected":      rejected,
+		"queueDepth":    stats.Depth,
+		"overflowFiles": stats.OverflowFiles,
 	})
 }
 

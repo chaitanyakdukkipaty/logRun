@@ -457,6 +457,7 @@ func streamPodLogsToLogrun(ctx context.Context, processID, commandID, namespace,
 		status = "failed"
 	}
 	_ = runner.updateCommandStatus(processID, commandID, status, exitCode, time.Now())
+	WaitForQueueDrain(5 * time.Second)
 	return nil
 }
 
