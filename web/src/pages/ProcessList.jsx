@@ -1,4 +1,4 @@
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, keepPreviousData } from '@tanstack/react-query'
 import { useEffect } from 'react'
 import { Link } from 'react-router-dom'
 import { formatDistanceToNow } from 'date-fns'
@@ -9,7 +9,16 @@ export default function ProcessList() {
   const { data: processes = [], isLoading, error, refetch } = useQuery({
     queryKey: ['processes'],
     queryFn: getProcesses,
-    refetchInterval: 5000, // Refresh every 5 seconds
+    // Only poll aggressively when there are running processes
+    refetchInterval: (query) => {
+      const data = query.state.data
+      if (!data || !Array.isArray(data)) return 10000
+      const hasRunning = data.some(p => p.status === 'running')
+      return hasRunning ? 3000 : 15000
+    },
+    // Keep showing previous data while background refetch is in flight (no flicker)
+    placeholderData: keepPreviousData,
+    staleTime: 2000,
   })
 
   // Cleanup stale processes periodically
