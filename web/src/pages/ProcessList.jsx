@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect } from 'react'
 import { Link } from 'react-router-dom'
 import { formatDistanceToNow } from 'date-fns'
 import { Play, Square, AlertCircle, Clock, ExternalLink, Trash2, Terminal } from 'lucide-react'
@@ -9,34 +9,43 @@ export default function ProcessList() {
   const [isLoading, setIsLoading] = useState(true)
   const [error, setError] = useState(null)
 
-  const connect = useCallback(() => {
-    const es = new EventSource('/api/processes/stream')
+  useEffect(() => {
+    let es
+    let retryTimer
+    let cancelled = false
 
-    es.onmessage = (e) => {
-      try {
-        const data = JSON.parse(e.data)
-        setProcesses(data)
-        setIsLoading(false)
-        setError(null)
-      } catch {
-        // ignore parse errors
+    function connect() {
+      if (cancelled) return
+      es = new EventSource('/api/processes/stream')
+
+      es.onmessage = (e) => {
+        try {
+          const data = JSON.parse(e.data)
+          setProcesses(data)
+          setIsLoading(false)
+          setError(null)
+        } catch {
+          // ignore non-JSON messages (e.g. heartbeat comments never reach onmessage)
+        }
+      }
+
+      es.onerror = () => {
+        es.close()
+        if (!cancelled) {
+          setError(new Error('Connection lost — retrying…'))
+          retryTimer = setTimeout(connect, 3000)
+        }
       }
     }
 
-    es.onerror = () => {
-      setError(new Error('Connection lost — retrying…'))
-      es.close()
-      // Reconnect after 3s
-      setTimeout(connect, 3000)
+    connect()
+
+    return () => {
+      cancelled = true
+      clearTimeout(retryTimer)
+      if (es) es.close()
     }
-
-    return es
   }, [])
-
-  useEffect(() => {
-    const es = connect()
-    return () => es.close()
-  }, [connect])
 
   const handleDelete = async (processId) => {
     if (window.confirm('Are you sure you want to delete this process and its logs?')) {
@@ -81,21 +90,6 @@ export default function ProcessList() {
     )
   }
 
-  if (error && processes.length === 0) {
-    return (
-      <div className="text-center py-12">
-        <AlertCircle className="h-12 w-12 text-red-500 mx-auto mb-4" />
-        <p className="text-red-600">Error loading processes: {error.message}</p>
-        <button 
-          onClick={() => { setError(null); setIsLoading(true); connect() }}
-          className="btn-primary mt-4"
-        >
-          Retry
-        </button>
-      </div>
-    )
-  }
-
   return (
     <div>
       <div className="mb-8">
@@ -104,6 +98,13 @@ export default function ProcessList() {
           Track and monitor your wrapped processes in real-time
         </p>
       </div>
+
+      {error && (
+        <div className="mb-4 flex items-center gap-2 rounded-md border border-yellow-300 bg-yellow-50 px-4 py-2 text-sm text-yellow-800">
+          <AlertCircle className="h-4 w-4 flex-shrink-0" />
+          {error.message}
+        </div>
+      )}
 
       {processes.length === 0 ? (
         <div className="text-center py-12 bg-white rounded-lg border border-gray-200">

@@ -855,6 +855,9 @@ func handleProcessListSSE(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 	}
 
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer heartbeat.Stop()
+
 	ctx := r.Context()
 	for {
 		select {
@@ -863,6 +866,10 @@ func handleProcessListSSE(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			fmt.Fprintf(w, "data: %s\n\n", msg)
+			flusher.Flush()
+		case <-heartbeat.C:
+			// SSE comment — keeps connection alive through proxies; not dispatched as a message event
+			fmt.Fprintf(w, ": ping\n\n")
 			flusher.Flush()
 		case <-ctx.Done():
 			return
