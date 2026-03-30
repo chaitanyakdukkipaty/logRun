@@ -46,3 +46,18 @@ vendor/
 # Temporary files
 *.tmp
 *.temp
+
+# LogRun runtime state
+.logrun-services.json
+
+# QA / scratch artifacts
+qa_analysis_dashboard.html
+qa_analysis_data.json
+qa_analysis_report.txt
+qa_error_analysis.py
+qa_error_analysis_api.py
+test_consolidation.sh
+s,s
+
+# Built CLI binaries (in subdirs)
+cmd/logrun/cli

@@ -1155,6 +1155,19 @@ app.listen(PORT, () => {
   console.log(`LogRun API server running on port ${PORT}`);
   initDatabase();
   
+  // Write port to state file so the CLI and other processes can discover it.
+  try {
+    const stateFile = path.join(__dirname, '..', '.logrun-services.json');
+    let state = {};
+    try { state = JSON.parse(fs.readFileSync(stateFile, 'utf8')); } catch (_) {}
+    state.api_port = Number(PORT);
+    state.updated_at = new Date().toISOString();
+    fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
+    console.log(`Service state written to ${stateFile}`);
+  } catch (err) {
+    console.warn('Could not write service state file:', err.message);
+  }
+
   // Initialize queue system
   setTimeout(() => {
     initWorkerPool();

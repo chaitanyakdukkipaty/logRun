@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useMemo } from 'react'
 import { useParams, Link, useNavigate } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { FixedSizeList as List } from 'react-window'
@@ -24,6 +24,8 @@ export default function ProcessDetail() {
   const navigate = useNavigate()
   const [searchQuery, setSearchQuery] = useState('')
   const [streamFilter, setStreamFilter] = useState('all')
+  const [beforeContext, setBeforeContext] = useState(0)
+  const [afterContext, setAfterContext] = useState(0)
   const [isStreaming, setIsStreaming] = useState(true)
   const [logs, setLogs] = useState([])
   const [modalLog, setModalLog] = useState(null)
@@ -146,13 +148,44 @@ export default function ProcessDetail() {
     }
   }, [showModal])
 
-  // Filter logs based on search and stream type
-  const filteredLogs = logs.filter(log => {
-    const matchesSearch = !searchQuery || 
-      log.message.toLowerCase().includes(searchQuery.toLowerCase())
-    const matchesStream = streamFilter === 'all' || log.stream === streamFilter
-    return matchesSearch && matchesStream
-  })
+  // Filter logs based on search, stream type, and optional context lines (-B/-A).
+  // Each entry is tagged with { isMatch, isContext } for display purposes.
+  const filteredLogs = useMemo(() => {
+    if (!searchQuery) {
+      // No search query — show all logs that pass the stream filter.
+      return logs
+        .filter(log => streamFilter === 'all' || log.stream === streamFilter)
+        .map(log => ({ ...log, isMatch: false, isContext: false }))
+    }
+
+    // Find indices of lines that match both search and stream filter.
+    const matchIndices = new Set()
+    logs.forEach((log, i) => {
+      const matchesSearch = log.message.toLowerCase().includes(searchQuery.toLowerCase())
+      const matchesStream = streamFilter === 'all' || log.stream === streamFilter
+      if (matchesSearch && matchesStream) matchIndices.add(i)
+    })
+
+    // Expand each match with beforeContext lines before and afterContext lines after.
+    // Map: index → isContext (false = it is itself a match)
+    const included = new Map()
+    matchIndices.forEach(i => {
+      // Register the match line (never overwrite a match with context).
+      if (!included.has(i)) included.set(i, false)
+      for (let b = 1; b <= beforeContext; b++) {
+        const idx = i - b
+        if (idx >= 0 && !included.has(idx)) included.set(idx, true)
+      }
+      for (let a = 1; a <= afterContext; a++) {
+        const idx = i + a
+        if (idx < logs.length && !included.has(idx)) included.set(idx, true)
+      }
+    })
+
+    return Array.from(included.entries())
+      .sort(([a], [b]) => a - b)
+      .map(([i, isContext]) => ({ ...logs[i], isMatch: !isContext, isContext }))
+  }, [logs, searchQuery, streamFilter, beforeContext, afterContext])
 
   // Function to sanitize log messages
   const sanitizeLogMessage = (message) => {
@@ -218,12 +251,19 @@ export default function ProcessDetail() {
     const displayMessage = isLongMessage 
       ? sanitizedMessage.substring(0, 150) + '...' 
       : sanitizedMessage
+
+    // Visual treatment: match lines get a left accent; context lines are dimmed.
+    const contextClass = log.isContext
+      ? 'opacity-50 border-l-2 border-gray-300 pl-1'
+      : log.isMatch
+        ? 'border-l-2 border-yellow-400 pl-1 bg-yellow-50'
+        : ''
     
     return (
       <div 
         style={style} 
-        className={`log-line ${log.stream === 'stderr' ? 'log-stderr' : 'log-stdout'} cursor-pointer hover:bg-gray-100 transition-colors`}
-        title="Click to view full log in modal"
+        className={`log-line ${log.stream === 'stderr' ? 'log-stderr' : 'log-stdout'} cursor-pointer hover:bg-gray-100 transition-colors ${contextClass}`}
+        title={log.isContext ? 'Context line' : log.isMatch ? 'Matching line' : 'Click to view full log in modal'}
         onClick={() => openLogModal(log, index)}
       >
         <div className="flex items-start space-x-2">
@@ -426,6 +466,34 @@ export default function ProcessDetail() {
               />
             </div>
 
+            {/* Before context (-B) */}
+            <div className="flex items-center space-x-1" title="Lines of leading context before each match (grep -B)">
+              <label className="text-xs font-mono text-gray-500 select-none">-B</label>
+              <input
+                type="number"
+                min="0"
+                max="200"
+                value={beforeContext}
+                onChange={(e) => setBeforeContext(Math.max(0, parseInt(e.target.value) || 0))}
+                disabled={!searchQuery}
+                className="w-14 px-2 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500 text-sm text-center disabled:opacity-40 disabled:cursor-not-allowed"
+              />
+            </div>
+
+            {/* After context (-A) */}
+            <div className="flex items-center space-x-1" title="Lines of trailing context after each match (grep -A)">
+              <label className="text-xs font-mono text-gray-500 select-none">-A</label>
+              <input
+                type="number"
+                min="0"
+                max="200"
+                value={afterContext}
+                onChange={(e) => setAfterContext(Math.max(0, parseInt(e.target.value) || 0))}
+                disabled={!searchQuery}
+                className="w-14 px-2 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500 text-sm text-center disabled:opacity-40 disabled:cursor-not-allowed"
+              />
+            </div>
+
             {/* Stream Filter */}
             <div className="flex items-center space-x-2">
               <Filter className="h-4 w-4 text-gray-500" />
@@ -487,6 +555,15 @@ export default function ProcessDetail() {
 
         <div className="mt-4 text-sm text-gray-600">
           Showing {filteredLogs.length} of {logs.length} log entries
+          {searchQuery && (beforeContext > 0 || afterContext > 0) && (() => {
+            const matchCount = filteredLogs.filter(l => l.isMatch).length
+            const contextCount = filteredLogs.length - matchCount
+            return (
+              <span className="ml-2 text-gray-500">
+                ({matchCount} match{matchCount !== 1 ? 'es' : ''}, {contextCount} context line{contextCount !== 1 ? 's' : ''})
+              </span>
+            )
+          })()}
           {logs.length >= 20000 && (
             <span className="ml-2 text-orange-600">
               (Limited to most recent 20k entries for performance)
