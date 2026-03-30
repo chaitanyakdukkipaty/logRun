@@ -21,8 +21,12 @@ import (
 var (
 	embeddedDB      *sql.DB
 	embeddedLogsDir string
-	sseClients      sync.Map // map[float64]*sseClient
+	sseClients      sync.Map // map[float64]*sseClient  — per-process log streams
 	sseClientsMu    sync.Mutex
+
+	// processListSSE broadcasts full process-list snapshots to subscribed browsers.
+	processListSSE   sync.Map // map[float64]chan string
+	processListSSEMu sync.Mutex
 )
 
 type sseClient struct {
@@ -78,6 +82,7 @@ func StartEmbeddedServer(port int) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", withCORS(handleHealth))
 	mux.HandleFunc("/health/queue", withCORS(handleHealthQueue))
+	mux.HandleFunc("/api/processes/stream", withCORS(handleProcessListSSE))
 	mux.HandleFunc("/api/processes", withCORS(handleProcesses))
 	mux.HandleFunc("/api/processes/", withCORS(handleProcessesSubroute))
 	mux.Handle("/", webFileServer())
@@ -207,6 +212,9 @@ func cleanupStaleRunningProcesses() (int, int) {
 	if running < 0 {
 		running = 0
 	}
+	if cleaned > 0 {
+		go broadcastProcessList()
+	}
 	return cleaned, running
 }
 
@@ -282,6 +290,7 @@ func handleCreateProcess(w http.ResponseWriter, r *http.Request) {
 			)
 			processID = existingID
 			consolidated = true
+			go broadcastProcessList()
 			writeJSON(w, http.StatusCreated, map[string]interface{}{
 				"message":      "Process created",
 				"process_id":   processID,
@@ -306,6 +315,7 @@ func handleCreateProcess(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	go broadcastProcessList()
 	writeJSON(w, http.StatusCreated, map[string]interface{}{
 		"message":      "Process created",
 		"process_id":   processID,
@@ -489,6 +499,7 @@ func handleUpdateProcess(w http.ResponseWriter, r *http.Request, id string) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
 		return
 	}
+	go broadcastProcessList()
 	writeJSON(w, http.StatusOK, map[string]string{"message": "Process updated"})
 }
 
@@ -501,6 +512,7 @@ func handleDeleteProcess(w http.ResponseWriter, r *http.Request, id string) {
 	n, _ := res.RowsAffected()
 	logPath := filepath.Join(embeddedLogsDir, id+".log")
 	_ = os.Remove(logPath)
+	go broadcastProcessList()
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"message":      "Process deleted",
 		"deleted_rows": n,
@@ -573,6 +585,7 @@ func handleUpdateCommand(w http.ResponseWriter, r *http.Request, processID, cmdI
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
+	go broadcastProcessList()
 	writeJSON(w, http.StatusOK, map[string]string{"message": "Command updated", "status": newStatus})
 }
 
@@ -800,7 +813,105 @@ func handleSSEStream(w http.ResponseWriter, r *http.Request, id string) {
 	}
 }
 
-// ── SSE broadcast ─────────────────────────────────────────────────────────────
+// ── Process-list SSE ──────────────────────────────────────────────────────────
+
+// handleProcessListSSE streams process-list snapshots to the browser.
+// A snapshot (full array) is pushed immediately on connect, then again
+// whenever any process is created, updated, or deleted.
+func handleProcessListSSE(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	ch := make(chan string, 16)
+
+	processListSSEMu.Lock()
+	var key float64
+	processListSSE.Range(func(k, _ interface{}) bool {
+		if f, ok := k.(float64); ok && f >= key {
+			key = f + 1
+		}
+		return true
+	})
+	key++
+	processListSSE.Store(key, ch)
+	processListSSEMu.Unlock()
+
+	defer func() {
+		processListSSE.Delete(key)
+		close(ch)
+	}()
+
+	// Send initial snapshot immediately.
+	if snap := processListSnapshot(); snap != "" {
+		fmt.Fprintf(w, "data: %s\n\n", snap)
+		flusher.Flush()
+	}
+
+	ctx := r.Context()
+	for {
+		select {
+		case msg, ok := <-ch:
+			if !ok {
+				return
+			}
+			fmt.Fprintf(w, "data: %s\n\n", msg)
+			flusher.Flush()
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// broadcastProcessList pushes a fresh process-list snapshot to all SSE subscribers.
+// Call after any mutation (create / update / delete / cleanup).
+func broadcastProcessList() {
+	snap := processListSnapshot()
+	if snap == "" {
+		return
+	}
+	processListSSE.Range(func(k, v interface{}) bool {
+		ch := v.(chan string)
+		select {
+		case ch <- snap:
+		default: // subscriber too slow — skip
+		}
+		return true
+	})
+}
+
+// processListSnapshot returns the current process list as a JSON string.
+func processListSnapshot() string {
+	if embeddedDB == nil {
+		return ""
+	}
+	rows, err := embeddedDB.Query(`
+		SELECT process_id, name, commands, status, start_time, end_time, tags, cwd
+		FROM processes
+		ORDER BY CASE WHEN status='running' THEN 0 ELSE 1 END, start_time DESC
+	`)
+	if err != nil {
+		return ""
+	}
+	defer rows.Close()
+	result := []map[string]interface{}{}
+	for rows.Next() {
+		if p := scanProcess(rows); p != nil {
+			result = append(result, p)
+		}
+	}
+	data, _ := json.Marshal(result)
+	return string(data)
+}
+
+// ── SSE broadcast (per-process log stream) ────────────────────────────────────
 
 func broadcastSSE(processID string, entry interface{}) {
 	data, _ := json.Marshal(entry)

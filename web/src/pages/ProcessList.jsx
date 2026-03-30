@@ -1,34 +1,50 @@
-import { useQuery, keepPreviousData } from '@tanstack/react-query'
+import { useState, useEffect, useCallback } from 'react'
 import { Link } from 'react-router-dom'
 import { formatDistanceToNow } from 'date-fns'
 import { Play, Square, AlertCircle, Clock, ExternalLink, Trash2, Terminal } from 'lucide-react'
-import { getProcesses, deleteProcess } from '../api/processes'
+import { deleteProcess } from '../api/processes'
 
 export default function ProcessList() {
-  const { data: processes = [], isLoading, error, refetch } = useQuery({
-    queryKey: ['processes'],
-    queryFn: getProcesses,
-    // Adaptive polling — fast when processes are running, slow otherwise
-    refetchInterval: (query) => {
-      const data = query.state.data
-      if (!data || !Array.isArray(data)) return 10000
-      return data.some(p => p.status === 'running') ? 3000 : 15000
-    },
-    // Keep previous data visible during background refetch — no flash
-    placeholderData: keepPreviousData,
-    staleTime: 2000,
-    // Only re-render when data or error changes, NOT on isFetching toggle
-    // (isFetching changes caused 2 extra re-renders per poll even with identical data)
-    notifyOnChangeProps: ['data', 'error', 'status'],
-  })
+  const [processes, setProcesses] = useState([])
+  const [isLoading, setIsLoading] = useState(true)
+  const [error, setError] = useState(null)
+
+  const connect = useCallback(() => {
+    const es = new EventSource('/api/processes/stream')
+
+    es.onmessage = (e) => {
+      try {
+        const data = JSON.parse(e.data)
+        setProcesses(data)
+        setIsLoading(false)
+        setError(null)
+      } catch {
+        // ignore parse errors
+      }
+    }
+
+    es.onerror = () => {
+      setError(new Error('Connection lost — retrying…'))
+      es.close()
+      // Reconnect after 3s
+      setTimeout(connect, 3000)
+    }
+
+    return es
+  }, [])
+
+  useEffect(() => {
+    const es = connect()
+    return () => es.close()
+  }, [connect])
 
   const handleDelete = async (processId) => {
     if (window.confirm('Are you sure you want to delete this process and its logs?')) {
       try {
         await deleteProcess(processId)
-        refetch()
-      } catch (error) {
-        console.error('Failed to delete process:', error)
+        // Server will push updated list via SSE automatically
+      } catch (err) {
+        console.error('Failed to delete process:', err)
         alert('Failed to delete process')
       }
     }
@@ -65,13 +81,13 @@ export default function ProcessList() {
     )
   }
 
-  if (error) {
+  if (error && processes.length === 0) {
     return (
       <div className="text-center py-12">
         <AlertCircle className="h-12 w-12 text-red-500 mx-auto mb-4" />
         <p className="text-red-600">Error loading processes: {error.message}</p>
         <button 
-          onClick={() => refetch()}
+          onClick={() => { setError(null); setIsLoading(true); connect() }}
           className="btn-primary mt-4"
         >
           Retry
