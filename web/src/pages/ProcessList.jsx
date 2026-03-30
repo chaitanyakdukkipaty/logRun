@@ -1,5 +1,4 @@
 import { useQuery, keepPreviousData } from '@tanstack/react-query'
-import { useEffect } from 'react'
 import { Link } from 'react-router-dom'
 import { formatDistanceToNow } from 'date-fns'
 import { Play, Square, AlertCircle, Clock, ExternalLink, Trash2, Terminal } from 'lucide-react'
@@ -9,34 +8,19 @@ export default function ProcessList() {
   const { data: processes = [], isLoading, error, refetch } = useQuery({
     queryKey: ['processes'],
     queryFn: getProcesses,
-    // Only poll aggressively when there are running processes
+    // Adaptive polling — fast when processes are running, slow otherwise
     refetchInterval: (query) => {
       const data = query.state.data
       if (!data || !Array.isArray(data)) return 10000
-      const hasRunning = data.some(p => p.status === 'running')
-      return hasRunning ? 3000 : 15000
+      return data.some(p => p.status === 'running') ? 3000 : 15000
     },
-    // Keep showing previous data while background refetch is in flight (no flicker)
+    // Keep previous data visible during background refetch — no flash
     placeholderData: keepPreviousData,
     staleTime: 2000,
+    // Only re-render when data or error changes, NOT on isFetching toggle
+    // (isFetching changes caused 2 extra re-renders per poll even with identical data)
+    notifyOnChangeProps: ['data', 'error', 'status'],
   })
-
-  // Cleanup stale processes periodically
-  useEffect(() => {
-    const cleanupStaleProcesses = async () => {
-      try {
-        await fetch('/api/health')
-      } catch (error) {
-        console.error('Failed to cleanup stale processes:', error)
-      }
-    }
-
-    // Cleanup immediately and then every 30 seconds
-    cleanupStaleProcesses()
-    const interval = setInterval(cleanupStaleProcesses, 30000)
-    
-    return () => clearInterval(interval)
-  }, [])
 
   const handleDelete = async (processId) => {
     if (window.confirm('Are you sure you want to delete this process and its logs?')) {

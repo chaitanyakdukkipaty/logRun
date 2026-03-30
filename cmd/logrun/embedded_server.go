@@ -89,6 +89,15 @@ func StartEmbeddedServer(port int) error {
 		}
 	}()
 
+	// Background goroutine: periodically clean up stale running processes.
+	// Replaces the frontend /api/health polling loop.
+	go func() {
+		cleanupStaleRunningProcesses()
+		for range time.Tick(30 * time.Second) {
+			cleanupStaleRunningProcesses()
+		}
+	}()
+
 	return nil
 }
 
@@ -115,10 +124,24 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 // ── /health ───────────────────────────────────────────────────────────────────
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
+	cleaned, running := cleanupStaleRunningProcesses()
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":             "OK",
+		"timestamp":          time.Now().UTC().Format(time.RFC3339),
+		"cleanedUpProcesses": cleaned,
+		"runningProcesses":   running,
+	})
+}
+
+// cleanupStaleRunningProcesses marks commands as 'cancelled' when their OS
+// process is no longer alive. Returns (cleaned, stillRunning) counts.
+func cleanupStaleRunningProcesses() (int, int) {
+	if embeddedDB == nil {
+		return 0, 0
+	}
 	rows, err := embeddedDB.Query(`SELECT process_id, commands FROM processes WHERE status = 'running'`)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
+		return 0, 0
 	}
 	defer rows.Close()
 
@@ -184,12 +207,7 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	if running < 0 {
 		running = 0
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"status":              "OK",
-		"timestamp":           time.Now().UTC().Format(time.RFC3339),
-		"cleanedUpProcesses":  cleaned,
-		"runningProcesses":    running,
-	})
+	return cleaned, running
 }
 
 func handleHealthQueue(w http.ResponseWriter, r *http.Request) {
