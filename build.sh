@@ -22,6 +22,7 @@ echo "✅ Web UI built -> web/dist/"
 
 # Copy built assets into cmd/logrun/web/dist/ so //go:embed finds them.
 echo "📋 Copying web assets to cmd/logrun/web/dist/..."
+mkdir -p cmd/logrun/web
 rm -rf cmd/logrun/web/dist
 cp -r web/dist cmd/logrun/web/dist
 echo "✅ Assets copied -> cmd/logrun/web/dist/"

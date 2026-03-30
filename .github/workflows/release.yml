@@ -34,6 +34,7 @@ jobs:
         npm run build
         cd ..
         # Copy to cmd/logrun/web/dist/ so //go:embed finds the files
+        mkdir -p cmd/logrun/web
         rm -rf cmd/logrun/web/dist
         cp -r web/dist cmd/logrun/web/dist
 
