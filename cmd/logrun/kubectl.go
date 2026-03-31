@@ -102,10 +102,13 @@ func runKubectl(cmd *cobra.Command, args []string) error {
 	// ── Step 1: Resolve namespace ────────────────────────────────────────────
 	ns := kubectlFlags.namespace
 	if ns == "" && !kubectlFlags.allNamespaces {
+		fmt.Print("Listing namespaces…")
 		namespaces, err := listNamespaces()
 		if err != nil {
+			fmt.Println()
 			return fmt.Errorf("failed to list namespaces: %w", err)
 		}
+		fmt.Println()
 		ns, err = promptSelectNamespace(namespaces)
 		if err != nil {
 			return err
@@ -113,10 +116,18 @@ func runKubectl(cmd *cobra.Command, args []string) error {
 	}
 
 	// ── Step 2: List all available pods (needed for both flows) ─────────────
+	fmt.Printf("Listing pods in %s…", func() string {
+		if kubectlFlags.allNamespaces {
+			return "all namespaces"
+		}
+		return ns
+	}())
 	allPods, err := listPods(ns, kubectlFlags.allNamespaces)
 	if err != nil {
+		fmt.Println()
 		return fmt.Errorf("failed to list pods: %w", err)
 	}
+	fmt.Println()
 
 	// ── Step 3: Resolve initial pod pattern(s) ───────────────────────────────
 	// --pod accepts comma-separated patterns; interactive mode prompts the user.
@@ -495,9 +506,16 @@ func kubectlLogsCmdStr(namespace, podName, container string) string {
 }
 
 // runKubectlCmd runs kubectl with the given args and returns stdout output.
+// It applies a 20-second timeout so a slow/unreachable API server doesn't
+// block indefinitely.
 func runKubectlCmd(args ...string) (string, error) {
-	c := exec.Command("kubectl", args...)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	c := exec.CommandContext(ctx, "kubectl", args...)
 	out, err := c.Output()
+	if ctx.Err() == context.DeadlineExceeded {
+		return "", fmt.Errorf("kubectl %s: timed out after 20s — is the cluster reachable?", strings.Join(args, " "))
+	}
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
 			return "", fmt.Errorf("kubectl %s: %s", strings.Join(args, " "), strings.TrimSpace(string(ee.Stderr)))

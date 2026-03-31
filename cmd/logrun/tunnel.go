@@ -198,6 +198,9 @@ func startZrokTunnel(port int) (string, *exec.Cmd, error) {
 				case urlCh <- url:
 				default:
 				}
+				// Keep draining so zrok never blocks on a full pipe buffer.
+				for scanner.Scan() {
+				}
 				return
 			}
 		}
