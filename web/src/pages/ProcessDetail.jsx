@@ -406,7 +406,7 @@ export default function ProcessDetail() {
                       <span className="text-xs text-gray-500 uppercase tracking-wide">
                         {cmd.status}
                       </span>
-                      {cmd.pid && (
+                      {cmd.pid > 0 && (
                         <span className="text-xs text-gray-500">PID: {cmd.pid}</span>
                       )}
                     </div>
