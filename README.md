@@ -1,34 +1,49 @@
 # LogRun
 
-A CLI + Web UI system for wrapping shell commands and Kubernetes pod logs with comprehensive logging, observability, and team sharing.
+A CLI + Web UI tool for wrapping shell commands and Kubernetes pod logs with comprehensive logging, real-time observability, and team sharing — all delivered as a **single self-contained binary**.
 
 ## Architecture
 
 ```
-+------------------+       +----------------+       +-------------------+
-| CLI (logrun)     | ----> | API (Node.js)  | ----> | Storage Layer     |
-| shell / kubectl  |       | REST + SQLite  |       | (DB + JSONL logs) |
-+------------------+       +----------------+       +-------------------+
-        |                          |
-        |                          v
-        | (auto-start)    +----------------+
-        +---------------> | Web UI (React) |
-                          +----------------+
-                                  |
-                    (optional)    v
-                         +------------------+
-                         | zrok / ngrok     |
-                         | Public Tunnels   |
-                         +------------------+
+┌─────────────────────────────────────────────────────────────────┐
+│                     logrun  (single binary)                     │
+│                                                                 │
+│  ┌──────────────┐   ┌──────────────────────────────────────┐   │
+│  │  CLI layer   │   │   Embedded HTTP server (:4000)       │   │
+│  │              │   │                                      │   │
+│  │  logrun cmd  │──▶│  /api/*   REST API  (SQLite)         │   │
+│  │  logrun      │   │  /api/*/stream  SSE  push            │   │
+│  │    kubectl   │   │  /        React SPA  (embedded)      │   │
+│  └──────────────┘   └──────────────────────────────────────┘   │
+│         │                         │                             │
+│         │ log queue (8192 cap)     │ SSE broadcasts             │
+│         │ + overflow to disk       │ (process list + logs)      │
+└─────────┼─────────────────────────┼─────────────────────────────┘
+          │                         │
+    ~/.logrun/                 browser tab
+    ├── logrun.db   (SQLite)
+    ├── logs/       (JSONL, one per process)
+    ├── overflow/   (queue spill files)
+    └── .services.json  (port + tunnel state)
+
+                    (optional)
+          ┌──────────────────────────┐
+          │   zrok / ngrok tunnel    │
+          │   public HTTPS URL       │
+          └──────────────────────────┘
 ```
 
-## Components
+### Key design decisions
 
-| Component | Location | Description |
-|-----------|----------|-------------|
-| CLI | `cmd/logrun/` | Go binary — wraps commands, kubectl, tunnel sharing |
-| API | `api/` | Node.js REST API + SQLite storage |
-| Web UI | `web/` | React + Vite dashboard |
+| Decision | Detail |
+|----------|--------|
+| **Single binary** | Go binary embeds the React build via `//go:embed`. No Node.js, no repo clone needed. |
+| **One port** | Both the REST API and the React SPA are served from the same port (default 4000). |
+| **Single server guarantee** | A file lock (`~/.logrun/.server.lock`) prevents duplicate servers. Multiple CLI instances share one. |
+| **SSE for real-time updates** | Process list pushed via SSE on every DB mutation — zero polling. Log streaming also via SSE. |
+| **Async log queue** | 8192-entry in-memory channel with JSONL overflow to `~/.logrun/overflow/`. Prevents data loss under log storms. |
+| **Dynamic port** | Falls back to any free port if 4000 is taken. Port written to state file so all instances use the same one. |
+| **Tunnel reuse** | Tunnel URL + PID persisted in `~/.logrun/.services.json`. Subsequent `--share` invocations reuse the running tunnel instead of spawning a new one. |
 
 ---
 
@@ -53,12 +68,6 @@ DEBUG=true curl -sSL https://raw.githubusercontent.com/chaitanyakdukkipaty/logRu
 curl -sSL https://raw.githubusercontent.com/chaitanyakdukkipaty/logRun/main/uninstall.sh | bash
 ```
 
-This will:
-1. Stop any running LogRun API / web processes
-2. Remove the `logrun` binary from `/usr/local/bin`
-3. Remove `.logrun-services.json` and `logrun.db` from the current directory
-4. Leave `./logs/` in place (remove manually if no longer needed)
-
 **Keep your data** (remove binary only):
 ```bash
 KEEP_DATA=true curl -sSL https://raw.githubusercontent.com/chaitanyakdukkipaty/logRun/main/uninstall.sh | bash
@@ -67,30 +76,20 @@ KEEP_DATA=true curl -sSL https://raw.githubusercontent.com/chaitanyakdukkipaty/l
 ### Build from source
 
 ```bash
-# CLI only
-cd cmd/logrun && go build -o ../../bin/logrun .
-
-# Everything (CLI + API deps + Web UI)
-./build.sh
+# Requires: Go 1.21+, Node.js 20+
+./build.sh            # builds web UI then Go binary → bin/logrun
+./build.sh v1.x.x true  # cross-compile all platforms → dist/
 ```
 
-### Run
-
-The CLI automatically starts the API and web services on first use — no manual setup required.
-
-```bash
-logrun npm run build          # wrap any shell command
-logrun pytest tests/          # capture test output
-logrun kubectl                # stream Kubernetes pod logs
-```
-
-Then open **http://localhost:3000** to view your logs.
+Push a `v*` tag to trigger the GitHub Actions release workflow automatically.
 
 ---
 
-## Features
+## Usage
 
-### Core — Wrap any command
+The CLI auto-starts the embedded server on first use — no manual setup required. Open **http://localhost:4000** to view the dashboard.
+
+### Wrap any command
 
 ```bash
 logrun <command> [args]
@@ -104,14 +103,10 @@ logrun --detach long-running-job   # run in background
 | `--name` | Friendly display name in the dashboard |
 | `--tags` | Comma-separated tags for filtering |
 | `--cwd` | Working directory for the command |
-| `--env KEY=VALUE` | Inject extra environment variables |
 | `--follow` | Stream logs live to stdout (default: on) |
 | `--detach` | Run in background |
-| `--api-url` | Custom API URL (default: `http://localhost:3001`) |
-
-### Service auto-start
-
-When you run any `logrun` command the API and web services start automatically if they aren't already running. Port state is stored in `.logrun-services.json` so multiple CLI instances always find the right ports.
+| `--api-url` | Custom API URL (default: `http://localhost:4000`) |
+| `--share` | Expose dashboard via zrok/ngrok tunnel |
 
 ### Kubernetes pod log streaming
 
@@ -120,113 +115,89 @@ logrun kubectl                            # fully interactive
 logrun kubectl -n prod -p my-app          # direct
 logrun kubectl -n staging -p "worker-" --tail 200
 logrun kubectl --all-namespaces -p api    # search all namespaces
+logrun kubectl --share -n prod -p my-app  # share dashboard while streaming
 ```
 
-- Interactive namespace and pod selection with type-to-filter search
-- Pod `--pod` flag accepts **comma-separated patterns** (substring or regex)
-- Add more patterns interactively via the confirmation menu
-- All matching pods are streamed **in parallel**, each tracked separately
+- Interactive namespace → pod selection with type-to-filter search
+- `--pod` accepts **comma-separated patterns** (substring or regex) — all matching pods streamed in parallel
+- Add more pods interactively via the confirmation menu before fetching begins
 - `--follow` defaults to **on** — logs stream live until Ctrl+C
 - Ctrl+C marks all pods as `cancelled` and cleans up gracefully
 
 | Flag | Description |
 |------|-------------|
 | `-n, --namespace` | Kubernetes namespace (interactive if omitted) |
-| `-p, --pod` | Pod name / substring / regex pattern (comma-separated) |
+| `-p, --pod` | Pod name / substring / regex (comma-separated; interactive if omitted) |
 | `-c, --container` | Container name for multi-container pods |
 | `-f, --follow` | Stream live (default: on; `--follow=false` for snapshot) |
-| `--tail` | Lines from end (`--tail` alone = 100, `--tail N` = N, no flag = all) |
+| `--tail` | Lines from end (`--tail` alone = 100, `--tail N` = N, omitted = all) |
 | `--since` | Only logs newer than a duration, e.g. `1h`, `30m` |
 | `--all-namespaces` | Search pods across all namespaces |
 
 ### Team sharing via zrok / ngrok
 
-Share your local LogRun dashboard with anyone on your team using a public tunnel.
-
 **Requirements:** [zrok](https://zrok.io) (`zrok enable <token>`) or [ngrok](https://ngrok.com) must be installed.
 
 ```bash
-# Standalone — block until Ctrl+C
-logrun share
-
-# Combined with any command
-logrun --share npm run build
-
-# Combined with kubectl
-logrun kubectl --share -n prod -p my-app
+logrun share                          # standalone — block until Ctrl+C
+logrun --share npm run build          # combined with any command
+logrun kubectl --share -n prod -p app # combined with kubectl
 ```
 
-On startup, tunnel URLs are printed before any prompts:
+On startup, the tunnel URL is printed and persisted:
 
 ```
-Starting tunnels…
-  ✓ API tunnel: https://abc123.share.zrok.io
-  ✓ Web tunnel: https://xyz456.share.zrok.io
+Starting tunnel…
+  ✓ Tunnel: https://abc123.share.zrok.io
 
 Share this with your team:
-  🌐 Dashboard: https://xyz456.share.zrok.io
-  📡 API:       https://abc123.share.zrok.io
+  🌐 Dashboard + API: https://abc123.share.zrok.io
 ```
 
-Teammates open the **Dashboard URL** in their browser — the Vite proxy routes all API calls transparently through the web tunnel to your local API.
+- **Single URL** serves both the dashboard and API (same port)
+- Tunnel URL is stored in `~/.logrun/.services.json`; re-running `--share` while the tunnel is alive **reuses the existing URL** instead of spawning a new one
+- Tunnels stay alive until Ctrl+C; logs streamed before sharing are accessible immediately
 
-Tunnels stay alive until you press **Ctrl+C**.
+---
 
-### Web UI
+## Web UI Features
 
-- **Process list** — all captured runs with status, tags, timestamps
-- **Log viewer** — full stdout/stderr with search and filtering
-- **Grep-style context** — `-B N` / `-A N` show N lines before/after each match
-- **Real-time streaming** — live log tail while a process is running
-- **Process metadata** — exit code, duration, environment, tags
+| Feature | Details |
+|---------|---------|
+| **Process list** | Real-time SSE push — updates instantly on any create/update/delete, zero polling |
+| **Log viewer** | Full stdout/stderr with search, stream filter (stdout/stderr), time range filter |
+| **Grep-style context** | `-B N` / `-A N` show N lines before/after each search match |
+| **Live log streaming** | SSE tail while a process is running — new lines appear without page refresh |
+| **Process metadata** | Status, exit code, duration, tags, CWD, all commands |
+| **Multi-command view** | Kubernetes processes show each pod as a separate command with individual status |
 
 ---
 
 ## Storage
 
-| Layer | Purpose |
-|-------|---------|
-| SQLite (`logrun.db`) | Process metadata, command info, indexing |
-| JSONL (`logs/<id>.log`) | Append-only log lines — fast writes, easy tailing |
+All data is stored under `~/.logrun/`:
+
+| Path | Purpose |
+|------|---------|
+| `~/.logrun/logrun.db` | SQLite — process metadata, command info, status |
+| `~/.logrun/logs/<id>.log` | JSONL — append-only log lines per process |
+| `~/.logrun/overflow/*.jsonl` | Queue spill files when in-memory queue is full |
+| `~/.logrun/.services.json` | Port, PID, tunnel URL — shared state across CLI instances |
+| `~/.logrun/.server.lock` | File lock — ensures only one embedded server runs |
 
 ---
 
 ## Development
 
 ```bash
-# API (port 3001)
-cd api && npm install && npm start
-
-# Web UI dev server (port 3000)
+# Web UI (hot reload on :5173, proxies API to :4000)
 cd web && npm install && npm run dev
 
-# CLI
+# Go CLI (rebuild after changes)
 cd cmd/logrun && go build -o ../../bin/logrun .
+
+# Full build (web + Go, production binary)
+./build.sh dev
 ```
 
-### Release
-
-```bash
-./build.sh v1.x.x true          # cross-compile all platforms → dist/
-./upload-release.sh v1.x.x      # upload to GitHub Releases
-```
-
-Or push a `v*` tag to trigger the GitHub Actions release workflow automatically.
-
----
-
-## Configuration
-
-The API port and web port are discovered automatically and written to `.logrun-services.json` at the project root. All three components (CLI, API, Vite) read and update this file so every instance finds the correct ports regardless of what was available at startup.
-
-```json
-{
-  "api_port": 3001,
-  "web_port": 3000,
-  "api_tunnel": "https://abc.share.zrok.io",
-  "web_tunnel": "https://xyz.share.zrok.io",
-  "updated_at": "2026-03-30T17:00:00Z"
-}
-```
-
-Set `VITE_API_URL` to point the web dev server's proxy at a non-default API URL.
+The Vite dev server proxies `/api/*` to `http://localhost:4000` so you can develop the UI while the Go server handles data.
