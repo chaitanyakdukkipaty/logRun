@@ -773,10 +773,26 @@ func promptMultiSelectPods(allPods []string, alreadySelected []string) ([]string
 			return nil, nil // deliberate cancel, not an error
 
 		case strings.HasPrefix(choice, selectAllPfx):
-			for _, p := range visiblePods {
-				selected[p] = true
+			// Determine which pods to actually select.
+			// If the user was actively typing a search this iteration, honour
+			// that search term — the items list was built before they typed so
+			// the label count may lag, but the selection must match what they see.
+			effectiveFilter := currentFilter
+			if searcherCalled && lastSearch != "" {
+				effectiveFilter = lastSearch
 			}
-			currentFilter = "" // clear filter after select-all, as requested
+			if effectiveFilter != "" {
+				for _, p := range displayPods {
+					if strings.Contains(strings.ToLower(p), strings.ToLower(effectiveFilter)) {
+						selected[p] = true
+					}
+				}
+			} else {
+				for _, p := range visiblePods {
+					selected[p] = true
+				}
+			}
+			currentFilter = "" // clear filter after select-all so full list is shown
 
 		case strings.HasPrefix(choice, clearFiltPfx):
 			currentFilter = ""
