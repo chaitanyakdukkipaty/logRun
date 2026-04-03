@@ -597,8 +597,11 @@ func promptSwitchContext(current string, contexts []string) (string, error) {
 	}
 	idx, _, err := prompt.Run()
 	if err != nil {
-		if err == promptui.ErrInterrupt || err == promptui.ErrEOF {
-			return current, nil // stay on current context
+		if err == promptui.ErrInterrupt {
+			os.Exit(130) // Ctrl+C — exit like a normal signal interrupt
+		}
+		if err == promptui.ErrEOF {
+			return current, nil // Escape — stay on current context
 		}
 		return "", fmt.Errorf("context selection cancelled: %w", err)
 	}
@@ -620,10 +623,10 @@ func promptSelectNamespace(namespaces []string) (string, error) {
 	}
 	_, result, err := prompt.Run()
 	if err != nil {
-		if err == promptui.ErrInterrupt || err == promptui.ErrEOF {
-			return "", fmt.Errorf("namespace selection cancelled")
+		if err == promptui.ErrInterrupt {
+			os.Exit(130)
 		}
-		return "", fmt.Errorf("namespace selection cancelled: %w", err)
+		return "", fmt.Errorf("namespace selection cancelled")
 	}
 	return result, nil
 }
@@ -733,8 +736,11 @@ func promptMultiSelectPods(allPods []string, alreadySelected []string) ([]string
 
 		idx, choice, err := prompt.Run()
 		if err != nil {
-			if err == promptui.ErrInterrupt || err == promptui.ErrEOF {
-				// Ctrl+C / Escape while typing — exit search mode, re-render.
+			if err == promptui.ErrInterrupt {
+				os.Exit(130) // Ctrl+C — kill the process
+			}
+			if err == promptui.ErrEOF {
+				// Escape while typing — exit search mode, re-render.
 				continue
 			}
 			return nil, fmt.Errorf("pod selection error: %w", err)
@@ -867,10 +873,10 @@ func promptConfirmPods(pods []string) (confirmAction, error) {
 	}
 	idx, _, err := prompt.Run()
 	if err != nil {
-		if err == promptui.ErrInterrupt || err == promptui.ErrEOF {
-			return confirmActionCancel, nil
+		if err == promptui.ErrInterrupt {
+			os.Exit(130)
 		}
-		return confirmActionCancel, fmt.Errorf("confirmation cancelled: %w", err)
+		return confirmActionCancel, nil
 	}
 	switch idx {
 	case 0:
@@ -904,10 +910,10 @@ func interactiveAddFromOtherNamespace(alreadyMatched []string) ([]string, error)
 	}
 	ctxIdx, _, ctxErr := ctxPrompt.Run()
 	if ctxErr != nil {
-		if ctxErr == promptui.ErrInterrupt || ctxErr == promptui.ErrEOF {
-			return nil, nil // user bailed out; caller will handle empty result
+		if ctxErr == promptui.ErrInterrupt {
+			os.Exit(130)
 		}
-		return nil, fmt.Errorf("cancelled: %w", ctxErr)
+		return nil, nil // Escape — bail out of this sub-flow gracefully
 	}
 
 	if ctxIdx == 1 {
