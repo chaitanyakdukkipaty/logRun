@@ -641,6 +641,32 @@ func promptSelectNamespace(namespaces []string) (string, error) {
 	return result, nil
 }
 
+// dynamicSelectAllLabel is used for the "⊕ Select all" item in the pod
+// multi-select list. It holds a pointer to the live search term so that
+// promptui's template rendering (which calls String() on every repaint)
+// always shows the count for the currently visible/filtered pods.
+// This works around the fact that promptui.list.New copies item values via
+// reflection — pointer items mean the struct's String() is re-evaluated
+// each render rather than using a stale copied string.
+type dynamicSelectAllLabel struct {
+	filterPtr *string  // points to the Searcher's live search input
+	pods      []string // the pre-filtered visible pod list
+}
+
+func (d *dynamicSelectAllLabel) String() string {
+	f := *d.filterPtr
+	if f == "" {
+		return fmt.Sprintf("⊕  Select all  (%d pods)", len(d.pods))
+	}
+	n := 0
+	for _, p := range d.pods {
+		if strings.Contains(strings.ToLower(p), strings.ToLower(f)) {
+			n++
+		}
+	}
+	return fmt.Sprintf("⊕  Select all matching \"%s\"  (%d pods)", f, n)
+}
+
 // promptMultiSelectPods shows an interactive, toggleable pod list with
 // persistent filter, "Select all matching", and inline "add from another
 // namespace" — all within a single promptui.Select loop.
@@ -698,15 +724,20 @@ func promptMultiSelectPods(allPods []string, alreadySelected []string) ([]string
 		nSel := countSelected(selected)
 		nVis := len(visiblePods)
 
-		// Build item list: sentinels first, then pods.
-		var items []string
+		// filterPtr is a heap-allocated string shared between the Searcher
+		// closure and the dynamicSelectAllLabel so that String() always
+		// reflects the live search input when promptui re-renders.
+		filterPtr := new(string)
+
+		// Build item list as []interface{}: sentinels first, then pods.
+		// The select-all item is a *dynamicSelectAllLabel so its String()
+		// is called fresh on every render (pointer is copied, not the struct).
+		var items []interface{}
 		items = append(items, fmt.Sprintf("%s  (%d selected)", donePrefix, nSel))
 		items = append(items, cancelLabel)
+		items = append(items, &dynamicSelectAllLabel{filterPtr: filterPtr, pods: visiblePods})
 		if currentFilter != "" {
-			items = append(items, fmt.Sprintf("%s \"%s\"  (%d pods)", selectAllPfx+" matching", currentFilter, nVis))
 			items = append(items, fmt.Sprintf("%s \"%s\"", clearFiltPfx, currentFilter))
-		} else {
-			items = append(items, fmt.Sprintf("%s  (%d pods)", selectAllPfx, nVis))
 		}
 		items = append(items, addOtherNS)
 		nSentinels := len(items)
@@ -723,9 +754,6 @@ func promptMultiSelectPods(allPods []string, alreadySelected []string) ([]string
 		searcherCalled := false
 		lastSearch := ""
 
-		// selectAllIdx is always index 2 regardless of how many sentinels there are.
-		const selectAllIdx = 2
-
 		label := fmt.Sprintf("Select pods  (%d selected)", nSel)
 		if currentFilter != "" {
 			label = fmt.Sprintf("Select pods  [filter: %q]  (%d/%d shown, %d selected)",
@@ -737,24 +765,10 @@ func promptMultiSelectPods(allPods []string, alreadySelected []string) ([]string
 			Items: items,
 			Size:  15,
 			Searcher: func(input string, idx int) bool {
-				// Update "Select all" label on every new keystroke so the count
-				// always reflects the currently visible (filtered) pod set.
-				// items is a local slice captured by closure; mutating it here
-				// is picked up by promptui's next render pass.
 				if input != lastSearch {
 					searcherCalled = true
 					lastSearch = input
-					n := 0
-					for _, p := range visiblePods {
-						if strings.Contains(strings.ToLower(p), strings.ToLower(input)) {
-							n++
-						}
-					}
-					if input != "" {
-						items[selectAllIdx] = fmt.Sprintf("%s \"%s\"  (%d pods)", selectAllPfx+" matching", input, n)
-					} else {
-						items[selectAllIdx] = fmt.Sprintf("%s  (%d pods)", selectAllPfx, nVis)
-					}
+					*filterPtr = input // drives dynamicSelectAllLabel.String()
 				}
 				if idx < nSentinels {
 					return true // always show sentinel controls
