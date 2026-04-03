@@ -149,7 +149,8 @@ func runKubectl(cmd *cobra.Command, args []string) error {
 	fmt.Println()
 
 	// ── Step 3: Resolve initial pod selection ────────────────────────────────
-	// --pod accepts comma-separated patterns; interactive mode offers pattern+manual.
+	// --pod accepts comma-separated patterns; interactive mode shows a
+	// searchable multi-select list (type to filter, enter to toggle).
 	var initialPatterns []string
 	if kubectlFlags.pod != "" {
 		for _, p := range strings.Split(kubectlFlags.pod, ",") {
@@ -158,14 +159,13 @@ func runKubectl(cmd *cobra.Command, args []string) error {
 			}
 		}
 	} else {
-		selected, promptErr := promptUnifiedPodSelection(allPods, nil)
+		selected, promptErr := promptMultiSelectPods(allPods, nil)
 		if promptErr != nil {
 			return promptErr
 		}
 		if len(selected) == 0 {
 			return fmt.Errorf("no pods selected")
 		}
-		// For non-pattern selections, treat each pod name as a literal pattern.
 		initialPatterns = selected
 	}
 
@@ -193,48 +193,20 @@ func runKubectl(cmd *cobra.Command, args []string) error {
 			switch action {
 			case confirmActionFetch:
 				// proceed
+
 			case confirmActionCancel:
 				return fmt.Errorf("cancelled by user")
 
 			case confirmActionAddMore:
-				// Pattern-based addition from the same namespace.
-				extraPattern, promptErr := promptPatternInput()
-				if promptErr != nil {
-					return promptErr
-				}
-				extra, matchErr := findMatchingPods(allPods, extraPattern)
-				if matchErr != nil {
-					fmt.Fprintf(os.Stderr, "warning: invalid pattern %q: %v\n", extraPattern, matchErr)
-					continue
-				}
-				if len(extra) == 0 {
-					fmt.Printf("No pods matched %q — try a different pattern.\n", extraPattern)
-					continue
-				}
-				matched = unionPods(matched, extra)
-				continue
-
-			case confirmActionAddMoreManual:
-				// Manual numbered selection from the same namespace.
-				extra, manErr := promptManualSelectPods(allPods, func() map[string]bool {
-					s := make(map[string]bool, len(matched))
-					for _, p := range matched {
-						s[p] = true
-					}
-					return s
-				}())
-				if manErr != nil {
-					return manErr
-				}
-				if len(extra) == 0 {
-					fmt.Println("No new pods selected.")
-					continue
+				// Show the multi-select list again with currently matched pods pre-checked.
+				extra, selErr := promptMultiSelectPods(allPods, matched)
+				if selErr != nil {
+					return selErr
 				}
 				matched = unionPods(matched, extra)
 				continue
 
 			case confirmActionAddOtherNS:
-				// Add pods from a completely different namespace (and optionally context).
 				extra, addErr := interactiveAddFromOtherNamespace(matched)
 				if addErr != nil {
 					fmt.Fprintf(os.Stderr, "warning: %v\n", addErr)
@@ -657,193 +629,114 @@ func promptSelectNamespace(namespaces []string) (string, error) {
 	return result, nil
 }
 
-// promptPatternInput prompts the user to enter a pod name / regex pattern.
-func promptPatternInput() (string, error) {
-	prompt := promptui.Prompt{
-		Label: "Enter pod name or pattern (substring / regex)",
-		Validate: func(input string) error {
-			if strings.TrimSpace(input) == "" {
-				return fmt.Errorf("pattern cannot be empty")
-			}
-			return nil
-		},
+// promptMultiSelectPods shows a searchable, toggleable list of pods mirroring
+// the namespace-selection UX but allowing multiple selections.
+//
+// Two sentinel items are prepended to the list:
+//   - "✓  Done  (N selected)" — confirm and return the current selection
+//   - "✗  Cancel"             — abort
+//
+// The user toggles individual pods by selecting them; the list re-renders with
+// updated [x]/[ ] markers. Typing filters the list (regex-style search).
+// alreadySelected pods start pre-checked.
+func promptMultiSelectPods(allPods []string, alreadySelected []string) ([]string, error) {
+	selected := make(map[string]bool, len(alreadySelected))
+	for _, p := range alreadySelected {
+		selected[p] = true
 	}
-	result, err := prompt.Run()
-	if err != nil {
-		return "", fmt.Errorf("pod pattern input cancelled: %w", err)
-	}
-	return strings.TrimSpace(result), nil
-}
 
-// parseNumberRanges parses a comma-separated list of numbers and ranges
-// (e.g. "1,3,5-8") into a slice of 1-based indices, clamped to [1, max].
-func parseNumberRanges(input string, max int) ([]int, error) {
-	var indices []int
-	seen := make(map[int]struct{})
-	for _, part := range strings.Split(input, ",") {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
+	const donePrefix   = "✓  Done"
+	const cancelLabel  = "✗  Cancel"
+
+	buildItems := func() []string {
+		n := countSelected(selected)
+		items := make([]string, 0, len(allPods)+2)
+		items = append(items, fmt.Sprintf("%s  (%d selected)", donePrefix, n))
+		items = append(items, cancelLabel)
+		for _, p := range allPods {
+			if selected[p] {
+				items = append(items, "[x] "+p)
+			} else {
+				items = append(items, "[ ] "+p)
+			}
 		}
-		if strings.Contains(part, "-") {
-			bounds := strings.SplitN(part, "-", 2)
-			var lo, hi int
-			if _, err := fmt.Sscanf(strings.TrimSpace(bounds[0]), "%d", &lo); err != nil {
-				return nil, fmt.Errorf("invalid range %q", part)
+		return items
+	}
+
+	for {
+		items := buildItems()
+		prompt := promptui.Select{
+			Label: "Select pods  (type to search/filter, enter to toggle)",
+			Items: items,
+			Size:  15,
+			Searcher: func(input string, idx int) bool {
+				// Always show the sentinel controls.
+				if idx < 2 {
+					return true
+				}
+				podName := allPods[idx-2]
+				return strings.Contains(strings.ToLower(podName), strings.ToLower(input))
+			},
+		}
+
+		idx, choice, err := prompt.Run()
+		if err != nil {
+			return nil, fmt.Errorf("pod selection cancelled: %w", err)
+		}
+
+		switch {
+		case idx == 1 || choice == cancelLabel:
+			return nil, fmt.Errorf("pod selection cancelled by user")
+		case idx == 0 || strings.HasPrefix(choice, donePrefix):
+			// Collect selected pods in original order.
+			var result []string
+			for _, p := range allPods {
+				if selected[p] {
+					result = append(result, p)
+				}
 			}
-			if _, err := fmt.Sscanf(strings.TrimSpace(bounds[1]), "%d", &hi); err != nil {
-				return nil, fmt.Errorf("invalid range %q", part)
-			}
-			if lo > hi {
-				lo, hi = hi, lo
-			}
-			for i := lo; i <= hi; i++ {
-				if i >= 1 && i <= max {
-					if _, ok := seen[i]; !ok {
-						seen[i] = struct{}{}
-						indices = append(indices, i)
+			// Also preserve any alreadySelected pods that aren't in allPods
+			// (e.g. pods from a different namespace added earlier).
+			for _, p := range alreadySelected {
+				found := false
+				for _, r := range result {
+					if r == p {
+						found = true
+						break
 					}
 				}
-			}
-		} else {
-			var n int
-			if _, err := fmt.Sscanf(part, "%d", &n); err != nil {
-				return nil, fmt.Errorf("invalid number %q", part)
-			}
-			if n >= 1 && n <= max {
-				if _, ok := seen[n]; !ok {
-					seen[n] = struct{}{}
-					indices = append(indices, n)
+				if !found {
+					result = append(result, p)
 				}
 			}
+			return result, nil
+		default:
+			// Toggle the pod at allPods[idx-2].
+			pod := allPods[idx-2]
+			selected[pod] = !selected[pod]
 		}
 	}
-	return indices, nil
 }
 
-// promptManualSelectPods shows a numbered list of pods and lets the user pick
-// by entering comma-separated numbers / ranges (e.g. "1,3,5-8").
-// Pods already in alreadySelected are shown with [x]; others with [ ].
-func promptManualSelectPods(allPods []string, alreadySelected map[string]bool) ([]string, error) {
-	fmt.Println()
-	fmt.Println("Available pods (enter numbers to select, e.g. 1,3,5-8):")
-	for i, p := range allPods {
-		marker := "[ ]"
-		if alreadySelected[p] {
-			marker = "[x]"
-		}
-		fmt.Printf("  %s %3d. %s\n", marker, i+1, p)
-	}
-	fmt.Println()
-
-	prompt := promptui.Prompt{
-		Label: "Enter pod numbers to add",
-		Validate: func(input string) error {
-			input = strings.TrimSpace(input)
-			if input == "" {
-				return fmt.Errorf("please enter at least one number")
-			}
-			_, err := parseNumberRanges(input, len(allPods))
-			return err
-		},
-	}
-	result, err := prompt.Run()
-	if err != nil {
-		return nil, fmt.Errorf("manual selection cancelled: %w", err)
-	}
-
-	indices, err := parseNumberRanges(strings.TrimSpace(result), len(allPods))
-	if err != nil {
-		return nil, err
-	}
-
-	var selected []string
-	for _, idx := range indices {
-		selected = append(selected, allPods[idx-1])
-	}
-	return selected, nil
-}
-
-// podSelectionMode represents how the user wants to select pods.
-type podSelectionMode int
-
-const (
-	selectionModePattern podSelectionMode = iota
-	selectionModeManual
-	selectionModeBoth
-)
-
-// promptUnifiedPodSelection asks the user to choose a selection mode, then
-// returns the resulting slice of pod names. alreadySelected is used to mark
-// pods that are already in the list (for the manual/Both display).
-func promptUnifiedPodSelection(allPods []string, alreadySelected []string) ([]string, error) {
-	alreadySet := make(map[string]bool, len(alreadySelected))
-	for _, p := range alreadySelected {
-		alreadySet[p] = true
-	}
-
-	modePrompt := promptui.Select{
-		Label: "Select pods by",
-		Items: []string{
-			"Pattern / regex",
-			"Manual selection (pick by number)",
-			"Both (pattern first, then pick more)",
-		},
-	}
-	modeIdx, _, err := modePrompt.Run()
-	if err != nil {
-		return nil, fmt.Errorf("mode selection cancelled: %w", err)
-	}
-	mode := podSelectionMode(modeIdx)
-
-	var result []string
-
-	if mode == selectionModePattern || mode == selectionModeBoth {
-		// Show available pod list, then ask for pattern.
-		fmt.Println("\nAvailable pods:")
-		for i, p := range allPods {
-			fmt.Printf("  %3d. %s\n", i+1, p)
-		}
-		fmt.Println()
-		pattern, promptErr := promptPatternInput()
-		if promptErr != nil {
-			return nil, promptErr
-		}
-		matched, matchErr := findMatchingPods(allPods, pattern)
-		if matchErr != nil {
-			return nil, fmt.Errorf("invalid pattern %q: %w", pattern, matchErr)
-		}
-		if len(matched) == 0 {
-			fmt.Printf("No pods matched %q.\n", pattern)
-		} else {
-			result = append(result, matched...)
+// countSelected returns the number of true values in a bool map.
+func countSelected(m map[string]bool) int {
+	n := 0
+	for _, v := range m {
+		if v {
+			n++
 		}
 	}
-
-	if mode == selectionModeManual || mode == selectionModeBoth {
-		// Merge pattern results into alreadySet so the manual list shows them.
-		for _, p := range result {
-			alreadySet[p] = true
-		}
-		manual, manErr := promptManualSelectPods(allPods, alreadySet)
-		if manErr != nil {
-			return nil, manErr
-		}
-		result = unionPods(result, manual)
-	}
-
-	return result, nil
+	return n
 }
 
 // confirmAction represents the user's choice at the confirmation prompt.
 type confirmAction int
 
 const (
-	confirmActionFetch        confirmAction = iota // proceed with fetching
-	confirmActionAddMore                           // add more pods via pattern (same namespace)
-	confirmActionAddMoreManual                     // add more pods via manual selection (same namespace)
-	confirmActionAddOtherNS                        // add pods from a different namespace
-	confirmActionCancel                            // abort
+	confirmActionFetch    confirmAction = iota // proceed with fetching
+	confirmActionAddMore                       // add more pods (same namespace)
+	confirmActionAddOtherNS                    // add pods from a different namespace
+	confirmActionCancel                        // abort
 )
 
 // promptConfirmPods shows the accumulated pod list and asks what to do next.
@@ -858,8 +751,7 @@ func promptConfirmPods(pods []string) (confirmAction, error) {
 		Label: "What would you like to do?",
 		Items: []string{
 			"Fetch logs from these pods",
-			"Add more pods (pattern / regex)",
-			"Add more pods (manual selection)",
+			"Add more pods (this namespace)",
 			"Add pods from another namespace",
 			"Cancel",
 		},
@@ -874,8 +766,6 @@ func promptConfirmPods(pods []string) (confirmAction, error) {
 	case 1:
 		return confirmActionAddMore, nil
 	case 2:
-		return confirmActionAddMoreManual, nil
-	case 3:
 		return confirmActionAddOtherNS, nil
 	default:
 		return confirmActionCancel, nil
@@ -885,15 +775,36 @@ func promptConfirmPods(pods []string) (confirmAction, error) {
 // ── Utility helpers ──────────────────────────────────────────────────────────
 
 // interactiveAddFromOtherNamespace guides the user through an optional context
-// switch → namespace selection → pod selection and returns the chosen pods,
+// switch → namespace selection → pod multi-select and returns the chosen pods,
 // each prefixed with "namespace/" so buildKubectlLogsArgs resolves them correctly.
 func interactiveAddFromOtherNamespace(alreadyMatched []string) ([]string, error) {
-	// Optional context switch.
-	if current, err := getCurrentContext(); err == nil {
-		if contexts, err := listContexts(); err == nil && len(contexts) > 1 {
-			chosen, ctxErr := promptSwitchContext(current, contexts)
-			if ctxErr != nil {
-				return nil, ctxErr
+	// Ask whether the user wants to switch context first (opt-in).
+	current, _ := getCurrentContext()
+	currentLabel := current
+	if currentLabel == "" {
+		currentLabel = "current"
+	}
+
+	ctxPrompt := promptui.Select{
+		Label: "Switch cluster/context first?",
+		Items: []string{
+			fmt.Sprintf("No, use current context (%s)", currentLabel),
+			"Yes, switch context",
+		},
+	}
+	ctxIdx, _, ctxErr := ctxPrompt.Run()
+	if ctxErr != nil {
+		return nil, fmt.Errorf("cancelled: %w", ctxErr)
+	}
+
+	if ctxIdx == 1 {
+		contexts, err := listContexts()
+		if err != nil || len(contexts) == 0 {
+			fmt.Println("Could not list contexts — continuing with current context.")
+		} else {
+			chosen, switchErr := promptSwitchContext(currentLabel, contexts)
+			if switchErr != nil {
+				return nil, switchErr
 			}
 			if chosen != current {
 				fmt.Printf("Switching context to %s…\n", chosen)
@@ -933,8 +844,8 @@ func interactiveAddFromOtherNamespace(alreadyMatched []string) ([]string, error)
 		prefixed[i] = newNS + "/" + p
 	}
 
-	// Unified selection on the prefixed list.
-	selected, err := promptUnifiedPodSelection(prefixed, alreadyMatched)
+	// Multi-select on the prefixed list, with already-matched pods pre-checked.
+	selected, err := promptMultiSelectPods(prefixed, alreadyMatched)
 	if err != nil {
 		return nil, err
 	}
