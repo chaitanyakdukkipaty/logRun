@@ -99,6 +99,25 @@ func runKubectl(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// ── Step 0: Optional cluster context switch (interactive only) ──────────
+	if kubectlFlags.namespace == "" && !kubectlFlags.allNamespaces {
+		if current, err := getCurrentContext(); err == nil {
+			if contexts, err := listContexts(); err == nil && len(contexts) > 1 {
+				chosen, ctxErr := promptSwitchContext(current, contexts)
+				if ctxErr != nil {
+					return ctxErr
+				}
+				if chosen != current {
+					fmt.Printf("Switching context to %s…\n", chosen)
+					if err := switchContext(chosen); err != nil {
+						return fmt.Errorf("failed to switch context: %w", err)
+					}
+					fmt.Printf("  ✓ Now using context: %s\n", chosen)
+				}
+			}
+		}
+	}
+
 	// ── Step 1: Resolve namespace ────────────────────────────────────────────
 	ns := kubectlFlags.namespace
 	if ns == "" && !kubectlFlags.allNamespaces {
@@ -129,8 +148,8 @@ func runKubectl(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Println()
 
-	// ── Step 3: Resolve initial pod pattern(s) ───────────────────────────────
-	// --pod accepts comma-separated patterns; interactive mode prompts the user.
+	// ── Step 3: Resolve initial pod selection ────────────────────────────────
+	// --pod accepts comma-separated patterns; interactive mode offers pattern+manual.
 	var initialPatterns []string
 	if kubectlFlags.pod != "" {
 		for _, p := range strings.Split(kubectlFlags.pod, ",") {
@@ -139,11 +158,15 @@ func runKubectl(cmd *cobra.Command, args []string) error {
 			}
 		}
 	} else {
-		p, promptErr := promptPodPattern(allPods)
+		selected, promptErr := promptUnifiedPodSelection(allPods, nil)
 		if promptErr != nil {
 			return promptErr
 		}
-		initialPatterns = []string{p}
+		if len(selected) == 0 {
+			return fmt.Errorf("no pods selected")
+		}
+		// For non-pattern selections, treat each pod name as a literal pattern.
+		initialPatterns = selected
 	}
 
 	// ── Step 4: Find matches and (interactive) accumulation loop ─────────────
@@ -172,8 +195,10 @@ func runKubectl(cmd *cobra.Command, args []string) error {
 				// proceed
 			case confirmActionCancel:
 				return fmt.Errorf("cancelled by user")
+
 			case confirmActionAddMore:
-				extraPattern, promptErr := promptPodPattern(allPods)
+				// Pattern-based addition from the same namespace.
+				extraPattern, promptErr := promptPatternInput()
 				if promptErr != nil {
 					return promptErr
 				}
@@ -184,6 +209,39 @@ func runKubectl(cmd *cobra.Command, args []string) error {
 				}
 				if len(extra) == 0 {
 					fmt.Printf("No pods matched %q — try a different pattern.\n", extraPattern)
+					continue
+				}
+				matched = unionPods(matched, extra)
+				continue
+
+			case confirmActionAddMoreManual:
+				// Manual numbered selection from the same namespace.
+				extra, manErr := promptManualSelectPods(allPods, func() map[string]bool {
+					s := make(map[string]bool, len(matched))
+					for _, p := range matched {
+						s[p] = true
+					}
+					return s
+				}())
+				if manErr != nil {
+					return manErr
+				}
+				if len(extra) == 0 {
+					fmt.Println("No new pods selected.")
+					continue
+				}
+				matched = unionPods(matched, extra)
+				continue
+
+			case confirmActionAddOtherNS:
+				// Add pods from a completely different namespace (and optionally context).
+				extra, addErr := interactiveAddFromOtherNamespace(matched)
+				if addErr != nil {
+					fmt.Fprintf(os.Stderr, "warning: %v\n", addErr)
+					continue
+				}
+				if len(extra) == 0 {
+					fmt.Println("No pods added from other namespace.")
 					continue
 				}
 				matched = unionPods(matched, extra)
@@ -527,6 +585,61 @@ func runKubectlCmd(args ...string) (string, error) {
 
 // ── Interactive prompts ──────────────────────────────────────────────────────
 
+// listContexts returns all kubectl context names from the kubeconfig.
+func listContexts() ([]string, error) {
+	out, err := runKubectlCmd("config", "get-contexts", "-o", "name")
+	if err != nil {
+		return nil, err
+	}
+	var ctxs []string
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if c := strings.TrimSpace(line); c != "" {
+			ctxs = append(ctxs, c)
+		}
+	}
+	return ctxs, nil
+}
+
+// getCurrentContext returns the currently active kubectl context name.
+func getCurrentContext() (string, error) {
+	out, err := runKubectlCmd("config", "current-context")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
+// switchContext runs `kubectl config use-context <name>`.
+func switchContext(name string) error {
+	_, err := runKubectlCmd("config", "use-context", name)
+	return err
+}
+
+// promptSwitchContext asks the user whether they want to switch kubectl context.
+// It returns the chosen context name (may be the same as current).
+func promptSwitchContext(current string, contexts []string) (string, error) {
+	keepLabel := fmt.Sprintf("Continue with current context (%s)", current)
+	items := []string{keepLabel}
+	items = append(items, contexts...)
+
+	prompt := promptui.Select{
+		Label: "Kubectl context (cluster)",
+		Items: items,
+		Size:  12,
+		Searcher: func(input string, idx int) bool {
+			return strings.Contains(strings.ToLower(items[idx]), strings.ToLower(input))
+		},
+	}
+	idx, _, err := prompt.Run()
+	if err != nil {
+		return "", fmt.Errorf("context selection cancelled: %w", err)
+	}
+	if idx == 0 {
+		return current, nil // user chose to keep current
+	}
+	return contexts[idx-1], nil
+}
+
 // promptSelectNamespace shows an interactive list of namespaces for the user to choose from.
 func promptSelectNamespace(namespaces []string) (string, error) {
 	prompt := promptui.Select{
@@ -544,14 +657,8 @@ func promptSelectNamespace(namespaces []string) (string, error) {
 	return result, nil
 }
 
-// promptPodPattern lists available pods and prompts the user to enter a pattern.
-func promptPodPattern(pods []string) (string, error) {
-	fmt.Println("\nAvailable pods:")
-	for i, p := range pods {
-		fmt.Printf("  %3d. %s\n", i+1, p)
-	}
-	fmt.Println()
-
+// promptPatternInput prompts the user to enter a pod name / regex pattern.
+func promptPatternInput() (string, error) {
 	prompt := promptui.Prompt{
 		Label: "Enter pod name or pattern (substring / regex)",
 		Validate: func(input string) error {
@@ -568,13 +675,175 @@ func promptPodPattern(pods []string) (string, error) {
 	return strings.TrimSpace(result), nil
 }
 
+// parseNumberRanges parses a comma-separated list of numbers and ranges
+// (e.g. "1,3,5-8") into a slice of 1-based indices, clamped to [1, max].
+func parseNumberRanges(input string, max int) ([]int, error) {
+	var indices []int
+	seen := make(map[int]struct{})
+	for _, part := range strings.Split(input, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if strings.Contains(part, "-") {
+			bounds := strings.SplitN(part, "-", 2)
+			var lo, hi int
+			if _, err := fmt.Sscanf(strings.TrimSpace(bounds[0]), "%d", &lo); err != nil {
+				return nil, fmt.Errorf("invalid range %q", part)
+			}
+			if _, err := fmt.Sscanf(strings.TrimSpace(bounds[1]), "%d", &hi); err != nil {
+				return nil, fmt.Errorf("invalid range %q", part)
+			}
+			if lo > hi {
+				lo, hi = hi, lo
+			}
+			for i := lo; i <= hi; i++ {
+				if i >= 1 && i <= max {
+					if _, ok := seen[i]; !ok {
+						seen[i] = struct{}{}
+						indices = append(indices, i)
+					}
+				}
+			}
+		} else {
+			var n int
+			if _, err := fmt.Sscanf(part, "%d", &n); err != nil {
+				return nil, fmt.Errorf("invalid number %q", part)
+			}
+			if n >= 1 && n <= max {
+				if _, ok := seen[n]; !ok {
+					seen[n] = struct{}{}
+					indices = append(indices, n)
+				}
+			}
+		}
+	}
+	return indices, nil
+}
+
+// promptManualSelectPods shows a numbered list of pods and lets the user pick
+// by entering comma-separated numbers / ranges (e.g. "1,3,5-8").
+// Pods already in alreadySelected are shown with [x]; others with [ ].
+func promptManualSelectPods(allPods []string, alreadySelected map[string]bool) ([]string, error) {
+	fmt.Println()
+	fmt.Println("Available pods (enter numbers to select, e.g. 1,3,5-8):")
+	for i, p := range allPods {
+		marker := "[ ]"
+		if alreadySelected[p] {
+			marker = "[x]"
+		}
+		fmt.Printf("  %s %3d. %s\n", marker, i+1, p)
+	}
+	fmt.Println()
+
+	prompt := promptui.Prompt{
+		Label: "Enter pod numbers to add",
+		Validate: func(input string) error {
+			input = strings.TrimSpace(input)
+			if input == "" {
+				return fmt.Errorf("please enter at least one number")
+			}
+			_, err := parseNumberRanges(input, len(allPods))
+			return err
+		},
+	}
+	result, err := prompt.Run()
+	if err != nil {
+		return nil, fmt.Errorf("manual selection cancelled: %w", err)
+	}
+
+	indices, err := parseNumberRanges(strings.TrimSpace(result), len(allPods))
+	if err != nil {
+		return nil, err
+	}
+
+	var selected []string
+	for _, idx := range indices {
+		selected = append(selected, allPods[idx-1])
+	}
+	return selected, nil
+}
+
+// podSelectionMode represents how the user wants to select pods.
+type podSelectionMode int
+
+const (
+	selectionModePattern podSelectionMode = iota
+	selectionModeManual
+	selectionModeBoth
+)
+
+// promptUnifiedPodSelection asks the user to choose a selection mode, then
+// returns the resulting slice of pod names. alreadySelected is used to mark
+// pods that are already in the list (for the manual/Both display).
+func promptUnifiedPodSelection(allPods []string, alreadySelected []string) ([]string, error) {
+	alreadySet := make(map[string]bool, len(alreadySelected))
+	for _, p := range alreadySelected {
+		alreadySet[p] = true
+	}
+
+	modePrompt := promptui.Select{
+		Label: "Select pods by",
+		Items: []string{
+			"Pattern / regex",
+			"Manual selection (pick by number)",
+			"Both (pattern first, then pick more)",
+		},
+	}
+	modeIdx, _, err := modePrompt.Run()
+	if err != nil {
+		return nil, fmt.Errorf("mode selection cancelled: %w", err)
+	}
+	mode := podSelectionMode(modeIdx)
+
+	var result []string
+
+	if mode == selectionModePattern || mode == selectionModeBoth {
+		// Show available pod list, then ask for pattern.
+		fmt.Println("\nAvailable pods:")
+		for i, p := range allPods {
+			fmt.Printf("  %3d. %s\n", i+1, p)
+		}
+		fmt.Println()
+		pattern, promptErr := promptPatternInput()
+		if promptErr != nil {
+			return nil, promptErr
+		}
+		matched, matchErr := findMatchingPods(allPods, pattern)
+		if matchErr != nil {
+			return nil, fmt.Errorf("invalid pattern %q: %w", pattern, matchErr)
+		}
+		if len(matched) == 0 {
+			fmt.Printf("No pods matched %q.\n", pattern)
+		} else {
+			result = append(result, matched...)
+		}
+	}
+
+	if mode == selectionModeManual || mode == selectionModeBoth {
+		// Merge pattern results into alreadySet so the manual list shows them.
+		for _, p := range result {
+			alreadySet[p] = true
+		}
+		manual, manErr := promptManualSelectPods(allPods, alreadySet)
+		if manErr != nil {
+			return nil, manErr
+		}
+		result = unionPods(result, manual)
+	}
+
+	return result, nil
+}
+
 // confirmAction represents the user's choice at the confirmation prompt.
 type confirmAction int
 
 const (
-	confirmActionFetch   confirmAction = iota // proceed with fetching
-	confirmActionAddMore                      // add another pattern
-	confirmActionCancel                       // abort
+	confirmActionFetch        confirmAction = iota // proceed with fetching
+	confirmActionAddMore                           // add more pods via pattern (same namespace)
+	confirmActionAddMoreManual                     // add more pods via manual selection (same namespace)
+	confirmActionAddOtherNS                        // add pods from a different namespace
+	confirmActionCancel                            // abort
 )
 
 // promptConfirmPods shows the accumulated pod list and asks what to do next.
@@ -588,9 +857,11 @@ func promptConfirmPods(pods []string) (confirmAction, error) {
 	prompt := promptui.Select{
 		Label: "What would you like to do?",
 		Items: []string{
-			"Yes, fetch logs from these pods",
-			"Add more pods (enter another pattern)",
-			"No, cancel",
+			"Fetch logs from these pods",
+			"Add more pods (pattern / regex)",
+			"Add more pods (manual selection)",
+			"Add pods from another namespace",
+			"Cancel",
 		},
 	}
 	idx, _, err := prompt.Run()
@@ -602,12 +873,73 @@ func promptConfirmPods(pods []string) (confirmAction, error) {
 		return confirmActionFetch, nil
 	case 1:
 		return confirmActionAddMore, nil
+	case 2:
+		return confirmActionAddMoreManual, nil
+	case 3:
+		return confirmActionAddOtherNS, nil
 	default:
 		return confirmActionCancel, nil
 	}
 }
 
 // ── Utility helpers ──────────────────────────────────────────────────────────
+
+// interactiveAddFromOtherNamespace guides the user through an optional context
+// switch → namespace selection → pod selection and returns the chosen pods,
+// each prefixed with "namespace/" so buildKubectlLogsArgs resolves them correctly.
+func interactiveAddFromOtherNamespace(alreadyMatched []string) ([]string, error) {
+	// Optional context switch.
+	if current, err := getCurrentContext(); err == nil {
+		if contexts, err := listContexts(); err == nil && len(contexts) > 1 {
+			chosen, ctxErr := promptSwitchContext(current, contexts)
+			if ctxErr != nil {
+				return nil, ctxErr
+			}
+			if chosen != current {
+				fmt.Printf("Switching context to %s…\n", chosen)
+				if err := switchContext(chosen); err != nil {
+					return nil, fmt.Errorf("failed to switch context: %w", err)
+				}
+				fmt.Printf("  ✓ Now using context: %s\n", chosen)
+			}
+		}
+	}
+
+	// Namespace selection.
+	fmt.Print("Listing namespaces…")
+	namespaces, err := listNamespaces()
+	if err != nil {
+		fmt.Println()
+		return nil, fmt.Errorf("failed to list namespaces: %w", err)
+	}
+	fmt.Println()
+	newNS, err := promptSelectNamespace(namespaces)
+	if err != nil {
+		return nil, err
+	}
+
+	// List pods in the chosen namespace.
+	fmt.Printf("Listing pods in %s…", newNS)
+	nsPods, err := listPods(newNS, false)
+	if err != nil {
+		fmt.Println()
+		return nil, fmt.Errorf("failed to list pods: %w", err)
+	}
+	fmt.Println()
+
+	// Build a prefixed pod list so the caller can tell which namespace they belong to.
+	prefixed := make([]string, len(nsPods))
+	for i, p := range nsPods {
+		prefixed[i] = newNS + "/" + p
+	}
+
+	// Unified selection on the prefixed list.
+	selected, err := promptUnifiedPodSelection(prefixed, alreadyMatched)
+	if err != nil {
+		return nil, err
+	}
+	return selected, nil
+}
 
 // parseKubectlTags splits a comma-separated tag string into a slice.
 func parseKubectlTags(raw string) []string {
