@@ -715,6 +715,9 @@ func promptMultiSelectPods(allPods []string, alreadySelected []string) ([]string
 		searcherCalled := false
 		lastSearch := ""
 
+		// selectAllIdx is always index 2 regardless of how many sentinels there are.
+		const selectAllIdx = 2
+
 		label := fmt.Sprintf("Select pods  (%d selected)", nSel)
 		if currentFilter != "" {
 			label = fmt.Sprintf("Select pods  [filter: %q]  (%d/%d shown, %d selected)",
@@ -726,8 +729,25 @@ func promptMultiSelectPods(allPods []string, alreadySelected []string) ([]string
 			Items: items,
 			Size:  15,
 			Searcher: func(input string, idx int) bool {
-				searcherCalled = true
-				lastSearch = input
+				// Update "Select all" label on every new keystroke so the count
+				// always reflects the currently visible (filtered) pod set.
+				// items is a local slice captured by closure; mutating it here
+				// is picked up by promptui's next render pass.
+				if input != lastSearch {
+					searcherCalled = true
+					lastSearch = input
+					n := 0
+					for _, p := range visiblePods {
+						if strings.Contains(strings.ToLower(p), strings.ToLower(input)) {
+							n++
+						}
+					}
+					if input != "" {
+						items[selectAllIdx] = fmt.Sprintf("%s \"%s\"  (%d pods)", selectAllPfx+" matching", input, n)
+					} else {
+						items[selectAllIdx] = fmt.Sprintf("%s  (%d pods)", selectAllPfx, nVis)
+					}
+				}
 				if idx < nSentinels {
 					return true // always show sentinel controls
 				}
