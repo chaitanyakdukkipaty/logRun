@@ -164,7 +164,8 @@ func runKubectl(cmd *cobra.Command, args []string) error {
 			return promptErr
 		}
 		if len(selected) == 0 {
-			return fmt.Errorf("no pods selected")
+			fmt.Println("No pods selected — exiting.")
+			return nil
 		}
 		initialPatterns = selected
 	}
@@ -202,6 +203,10 @@ func runKubectl(cmd *cobra.Command, args []string) error {
 				extra, selErr := promptMultiSelectPods(allPods, matched)
 				if selErr != nil {
 					return selErr
+				}
+				if len(extra) == 0 {
+					fmt.Println("No additional pods selected.")
+					continue
 				}
 				matched = unionPods(matched, extra)
 				continue
@@ -604,6 +609,9 @@ func promptSwitchContext(current string, contexts []string) (string, error) {
 	}
 	idx, _, err := prompt.Run()
 	if err != nil {
+		if err == promptui.ErrInterrupt || err == promptui.ErrEOF {
+			return current, nil // stay on current context
+		}
 		return "", fmt.Errorf("context selection cancelled: %w", err)
 	}
 	if idx == 0 {
@@ -624,6 +632,9 @@ func promptSelectNamespace(namespaces []string) (string, error) {
 	}
 	_, result, err := prompt.Run()
 	if err != nil {
+		if err == promptui.ErrInterrupt || err == promptui.ErrEOF {
+			return "", fmt.Errorf("namespace selection cancelled")
+		}
 		return "", fmt.Errorf("namespace selection cancelled: %w", err)
 	}
 	return result, nil
@@ -681,12 +692,19 @@ func promptMultiSelectPods(allPods []string, alreadySelected []string) ([]string
 
 		idx, choice, err := prompt.Run()
 		if err != nil {
-			return nil, fmt.Errorf("pod selection cancelled: %w", err)
+			if err == promptui.ErrInterrupt || err == promptui.ErrEOF {
+				// Ctrl+C / Escape while in search mode — just exit the search
+				// and re-render the list. Don't abort the whole selection.
+				continue
+			}
+			return nil, fmt.Errorf("pod selection error: %w", err)
 		}
 
 		switch {
 		case idx == 1 || choice == cancelLabel:
-			return nil, fmt.Errorf("pod selection cancelled by user")
+			// Deliberate cancel — return nil, nil (not an error) so callers
+			// can handle "nothing selected" gracefully.
+			return nil, nil
 		case idx == 0 || strings.HasPrefix(choice, donePrefix):
 			// Collect selected pods in original order.
 			var result []string
@@ -758,6 +776,9 @@ func promptConfirmPods(pods []string) (confirmAction, error) {
 	}
 	idx, _, err := prompt.Run()
 	if err != nil {
+		if err == promptui.ErrInterrupt || err == promptui.ErrEOF {
+			return confirmActionCancel, nil
+		}
 		return confirmActionCancel, fmt.Errorf("confirmation cancelled: %w", err)
 	}
 	switch idx {
@@ -794,6 +815,9 @@ func interactiveAddFromOtherNamespace(alreadyMatched []string) ([]string, error)
 	}
 	ctxIdx, _, ctxErr := ctxPrompt.Run()
 	if ctxErr != nil {
+		if ctxErr == promptui.ErrInterrupt || ctxErr == promptui.ErrEOF {
+			return nil, nil // user bailed out; caller will handle empty result
+		}
 		return nil, fmt.Errorf("cancelled: %w", ctxErr)
 	}
 
