@@ -148,40 +148,42 @@ func runKubectl(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Println()
 
-	// ── Step 3: Resolve initial pod selection ────────────────────────────────
-	// --pod accepts comma-separated patterns; interactive mode shows a
-	// searchable multi-select list (type to filter, enter to toggle).
-	var initialPatterns []string
+	// ── Steps 3 + 4: Resolve pod selection and optional refinement loop ────────
+	var matched []string
+
 	if kubectlFlags.pod != "" {
+		// --pod flag: treat values as patterns, match against allPods.
+		var patterns []string
 		for _, p := range strings.Split(kubectlFlags.pod, ",") {
 			if t := strings.TrimSpace(p); t != "" {
-				initialPatterns = append(initialPatterns, t)
+				patterns = append(patterns, t)
 			}
 		}
+		var matchErr error
+		matched, matchErr = matchPodsFromPatterns(allPods, patterns)
+		if matchErr != nil {
+			return matchErr
+		}
+		if len(matched) == 0 {
+			nsLabel := ns
+			if kubectlFlags.allNamespaces {
+				nsLabel = "all namespaces"
+			}
+			return fmt.Errorf("no pods matched %v in %s", patterns, nsLabel)
+		}
 	} else {
-		selected, promptErr := promptMultiSelectPods(allPods, nil)
+		// Interactive: multi-select returns exact pod names (including cross-
+		// namespace "ns/pod" entries). Skip matchPodsFromPatterns — those names
+		// are already resolved and must not be searched against allPods.
+		var promptErr error
+		matched, promptErr = promptMultiSelectPods(allPods, nil)
 		if promptErr != nil {
 			return promptErr
 		}
-		if len(selected) == 0 {
+		if len(matched) == 0 {
 			fmt.Println("No pods selected — exiting.")
 			return nil
 		}
-		initialPatterns = selected
-	}
-
-	// ── Step 4: Find matches and (interactive) accumulation loop ─────────────
-	// matched is a de-duplicated ordered set of pod names across all patterns.
-	matched, err := matchPodsFromPatterns(allPods, initialPatterns)
-	if err != nil {
-		return err
-	}
-	if len(matched) == 0 {
-		nsLabel := ns
-		if kubectlFlags.allNamespaces {
-			nsLabel = "all namespaces"
-		}
-		return fmt.Errorf("no pods matched %v in %s", initialPatterns, nsLabel)
 	}
 
 	// In interactive mode, let the user refine the selection before fetching.
@@ -223,7 +225,7 @@ func runKubectl(cmd *cobra.Command, args []string) error {
 		if kubectlFlags.allNamespaces {
 			nsLabel = "all-namespaces"
 		}
-		processName = fmt.Sprintf("kubectl/%s/%s", nsLabel, strings.Join(initialPatterns, ","))
+		processName = fmt.Sprintf("kubectl/%s/%s", nsLabel, strings.Join(matched, ","))
 	}
 
 	tagList := parseKubectlTags(kubectlTags)
