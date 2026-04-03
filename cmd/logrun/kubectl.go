@@ -199,26 +199,14 @@ func runKubectl(cmd *cobra.Command, args []string) error {
 				return fmt.Errorf("cancelled by user")
 
 			case confirmActionAddMore:
-				// Show the multi-select list again with currently matched pods pre-checked.
+				// Re-open the multi-select picker with current selection pre-checked.
+				// "Add from another namespace" is available inside the picker itself.
 				extra, selErr := promptMultiSelectPods(allPods, matched)
 				if selErr != nil {
 					return selErr
 				}
 				if len(extra) == 0 {
 					fmt.Println("No additional pods selected.")
-					continue
-				}
-				matched = unionPods(matched, extra)
-				continue
-
-			case confirmActionAddOtherNS:
-				extra, addErr := interactiveAddFromOtherNamespace(matched)
-				if addErr != nil {
-					fmt.Fprintf(os.Stderr, "warning: %v\n", addErr)
-					continue
-				}
-				if len(extra) == 0 {
-					fmt.Println("No pods added from other namespace.")
 					continue
 				}
 				matched = unionPods(matched, extra)
@@ -640,100 +628,189 @@ func promptSelectNamespace(namespaces []string) (string, error) {
 	return result, nil
 }
 
-// promptMultiSelectPods shows a searchable, toggleable list of pods mirroring
-// the namespace-selection UX but allowing multiple selections.
+// promptMultiSelectPods shows an interactive, toggleable pod list with
+// persistent filter, "Select all matching", and inline "add from another
+// namespace" — all within a single promptui.Select loop.
 //
-// Two sentinel items are prepended to the list:
-//   - "✓  Done  (N selected)" — confirm and return the current selection
-//   - "✗  Cancel"             — abort
+// Sentinel items at the top of the list:
+//   ✓  Done  (N selected)          — confirm and return
+//   ✗  Cancel                      — abort (returns nil, nil)
+//   ⊕  Select all (M pods)         — when no filter: select all visible pods
+//   ⊕  Select all matching "x" (M) — when filter active: select all filtered pods
+//   ✕  Clear filter: "x"           — clear the active filter
+//   📁  Add pods from another namespace
 //
-// The user toggles individual pods by selecting them; the list re-renders with
-// updated [x]/[ ] markers. Typing filters the list (regex-style search).
-// alreadySelected pods start pre-checked.
+// Filter persistence: the Searcher closure captures the last typed input; after
+// each toggle the filter is preserved so the user does not have to retype.
+// The user can clear the filter explicitly via the "✕ Clear filter" sentinel or
+// by backspacing the search input until it is empty.
 func promptMultiSelectPods(allPods []string, alreadySelected []string) ([]string, error) {
+	// selected covers both allPods and any externalPods added inline.
 	selected := make(map[string]bool, len(alreadySelected))
 	for _, p := range alreadySelected {
 		selected[p] = true
 	}
 
-	const donePrefix   = "✓  Done"
-	const cancelLabel  = "✗  Cancel"
+	// externalPods accumulates pods from other namespaces added inline.
+	var externalPods []string
 
-	buildItems := func() []string {
-		n := countSelected(selected)
-		items := make([]string, 0, len(allPods)+2)
-		items = append(items, fmt.Sprintf("%s  (%d selected)", donePrefix, n))
+	// currentFilter is the persistent filter string (survives across toggles).
+	var currentFilter string
+
+	const (
+		donePrefix   = "✓  Done"
+		cancelLabel  = "✗  Cancel"
+		selectAllPfx = "⊕  Select all"
+		clearFiltPfx = "✕  Clear filter:"
+		addOtherNS   = "📁  Add pods from another namespace"
+	)
+
+	for {
+		// Build the full ordered pod list for this iteration.
+		displayPods := make([]string, 0, len(allPods)+len(externalPods))
+		displayPods = append(displayPods, allPods...)
+		displayPods = append(displayPods, externalPods...)
+
+		// Apply persistent filter to compute the visible pod subset.
+		visiblePods := displayPods
+		if currentFilter != "" {
+			visiblePods = nil
+			for _, p := range displayPods {
+				if strings.Contains(strings.ToLower(p), strings.ToLower(currentFilter)) {
+					visiblePods = append(visiblePods, p)
+				}
+			}
+		}
+
+		nSel := countSelected(selected)
+		nVis := len(visiblePods)
+
+		// Build item list: sentinels first, then pods.
+		var items []string
+		items = append(items, fmt.Sprintf("%s  (%d selected)", donePrefix, nSel))
 		items = append(items, cancelLabel)
-		for _, p := range allPods {
+		if currentFilter != "" {
+			items = append(items, fmt.Sprintf("%s \"%s\"  (%d pods)", selectAllPfx+" matching", currentFilter, nVis))
+			items = append(items, fmt.Sprintf("%s \"%s\"", clearFiltPfx, currentFilter))
+		} else {
+			items = append(items, fmt.Sprintf("%s  (%d pods)", selectAllPfx, nVis))
+		}
+		items = append(items, addOtherNS)
+		nSentinels := len(items)
+
+		for _, p := range visiblePods {
 			if selected[p] {
 				items = append(items, "[x] "+p)
 			} else {
 				items = append(items, "[ ] "+p)
 			}
 		}
-		return items
-	}
 
-	for {
-		items := buildItems()
+		// searcherCalled / lastSearch track filter persistence.
+		searcherCalled := false
+		lastSearch := ""
+
+		label := fmt.Sprintf("Select pods  (%d selected)", nSel)
+		if currentFilter != "" {
+			label = fmt.Sprintf("Select pods  [filter: %q]  (%d/%d shown, %d selected)",
+				currentFilter, nVis, len(displayPods), nSel)
+		}
+
 		prompt := promptui.Select{
-			Label: "Select pods  (type to search/filter, enter to toggle)",
+			Label: label,
 			Items: items,
 			Size:  15,
 			Searcher: func(input string, idx int) bool {
-				// Always show the sentinel controls.
-				if idx < 2 {
-					return true
+				searcherCalled = true
+				lastSearch = input
+				if idx < nSentinels {
+					return true // always show sentinel controls
 				}
-				podName := allPods[idx-2]
-				return strings.Contains(strings.ToLower(podName), strings.ToLower(input))
+				pod := visiblePods[idx-nSentinels]
+				return strings.Contains(strings.ToLower(pod), strings.ToLower(input))
 			},
 		}
 
 		idx, choice, err := prompt.Run()
 		if err != nil {
 			if err == promptui.ErrInterrupt || err == promptui.ErrEOF {
-				// Ctrl+C / Escape while in search mode — just exit the search
-				// and re-render the list. Don't abort the whole selection.
+				// Ctrl+C / Escape while typing — exit search mode, re-render.
 				continue
 			}
 			return nil, fmt.Errorf("pod selection error: %w", err)
 		}
 
+		// Persist (or clear) filter based on what the user typed this round.
+		if searcherCalled {
+			currentFilter = lastSearch
+		}
+
 		switch {
-		case idx == 1 || choice == cancelLabel:
-			// Deliberate cancel — return nil, nil (not an error) so callers
-			// can handle "nothing selected" gracefully.
-			return nil, nil
 		case idx == 0 || strings.HasPrefix(choice, donePrefix):
-			// Collect selected pods in original order.
+			// Collect selected pods in display order.
 			var result []string
-			for _, p := range allPods {
+			for _, p := range displayPods {
 				if selected[p] {
 					result = append(result, p)
 				}
 			}
-			// Also preserve any alreadySelected pods that aren't in allPods
-			// (e.g. pods from a different namespace added earlier).
+			// Preserve any alreadySelected pods not in displayPods.
 			for _, p := range alreadySelected {
-				found := false
+				inResult := false
 				for _, r := range result {
 					if r == p {
-						found = true
+						inResult = true
 						break
 					}
 				}
-				if !found {
+				if !inResult {
 					result = append(result, p)
 				}
 			}
 			return result, nil
+
+		case idx == 1 || choice == cancelLabel:
+			return nil, nil // deliberate cancel, not an error
+
+		case strings.HasPrefix(choice, selectAllPfx):
+			for _, p := range visiblePods {
+				selected[p] = true
+			}
+			currentFilter = "" // clear filter after select-all, as requested
+
+		case strings.HasPrefix(choice, clearFiltPfx):
+			currentFilter = ""
+
+		case choice == addOtherNS:
+			extra, addErr := interactiveAddFromOtherNamespace(nil)
+			if addErr != nil {
+				fmt.Fprintf(os.Stderr, "warning: %v\n", addErr)
+				continue
+			}
+			for _, p := range extra {
+				if !containsString(externalPods, p) {
+					externalPods = append(externalPods, p)
+				}
+				selected[p] = true // auto-select newly added pods
+			}
+
 		default:
-			// Toggle the pod at allPods[idx-2].
-			pod := allPods[idx-2]
-			selected[pod] = !selected[pod]
+			if idx >= nSentinels {
+				pod := visiblePods[idx-nSentinels]
+				selected[pod] = !selected[pod]
+			}
 		}
 	}
+}
+
+// containsString reports whether s appears in slice.
+func containsString(slice []string, s string) bool {
+	for _, v := range slice {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }
 
 // countSelected returns the number of true values in a bool map.
@@ -751,10 +828,9 @@ func countSelected(m map[string]bool) int {
 type confirmAction int
 
 const (
-	confirmActionFetch    confirmAction = iota // proceed with fetching
-	confirmActionAddMore                       // add more pods (same namespace)
-	confirmActionAddOtherNS                    // add pods from a different namespace
-	confirmActionCancel                        // abort
+	confirmActionFetch  confirmAction = iota // proceed with fetching
+	confirmActionAddMore                     // add more pods (same namespace)
+	confirmActionCancel                      // abort
 )
 
 // promptConfirmPods shows the accumulated pod list and asks what to do next.
@@ -769,8 +845,7 @@ func promptConfirmPods(pods []string) (confirmAction, error) {
 		Label: "What would you like to do?",
 		Items: []string{
 			"Fetch logs from these pods",
-			"Add more pods (this namespace)",
-			"Add pods from another namespace",
+			"Add / change pods",
 			"Cancel",
 		},
 	}
@@ -786,8 +861,6 @@ func promptConfirmPods(pods []string) (confirmAction, error) {
 		return confirmActionFetch, nil
 	case 1:
 		return confirmActionAddMore, nil
-	case 2:
-		return confirmActionAddOtherNS, nil
 	default:
 		return confirmActionCancel, nil
 	}
