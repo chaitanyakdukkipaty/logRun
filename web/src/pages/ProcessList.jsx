@@ -157,7 +157,7 @@ export default function ProcessList() {
                           'bg-red-400'
                         }`}></div>
                         <div>
-                          <div className="text-sm font-medium text-gray-900">
+                          <div className="text-sm font-medium text-gray-900 max-w-sm truncate" title={process.name || 'Unnamed Process'}>
                             {process.name || 'Unnamed Process'}
                           </div>
                           <div className="text-sm text-gray-500">

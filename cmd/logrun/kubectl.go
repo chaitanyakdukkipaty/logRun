@@ -225,7 +225,15 @@ func runKubectl(cmd *cobra.Command, args []string) error {
 		if kubectlFlags.allNamespaces {
 			nsLabel = "all-namespaces"
 		}
-		processName = fmt.Sprintf("kubectl/%s/%s", nsLabel, strings.Join(matched, ","))
+		// Use a compact name: show first pod name (or pattern for --pod flag),
+		// with "+N more" when multiple pods are selected.
+		var podLabel string
+		if len(matched) == 1 {
+			podLabel = matched[0]
+		} else {
+			podLabel = fmt.Sprintf("%s +%d more", matched[0], len(matched)-1)
+		}
+		processName = fmt.Sprintf("kubectl/%s/%s", nsLabel, podLabel)
 	}
 
 	tagList := parseKubectlTags(kubectlTags)
